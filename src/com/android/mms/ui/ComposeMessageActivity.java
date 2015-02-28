@@ -2004,12 +2004,13 @@ public class ComposeMessageActivity extends Activity
         resetConfiguration(getResources().getConfiguration());
 
         SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(this);
-        int unicodeStripping = prefs.getInt(MessagingPreferenceActivity.UNICODE_STRIPPING,
+        String unicodeStripping = prefs.getString(MessagingPreferenceActivity.UNICODE_STRIPPING,
                 MessagingPreferenceActivity.UNICODE_STRIPPING_LEAVE_INTACT);
 
-        if (unicodeStripping != MessagingPreferenceActivity.UNICODE_STRIPPING_LEAVE_INTACT) {
-            boolean stripNonDecodableOnly =
-                    unicodeStripping == MessagingPreferenceActivity.UNICODE_STRIPPING_NON_DECODABLE;
+        if (!TextUtils.equals(unicodeStripping,
+                MessagingPreferenceActivity.UNICODE_STRIPPING_LEAVE_INTACT)) {
+            boolean stripNonDecodableOnly = TextUtils.equals(unicodeStripping,
+                    MessagingPreferenceActivity.UNICODE_STRIPPING_NON_DECODABLE);
             mUnicodeFilter = new UnicodeFilter(stripNonDecodableOnly);
         }
 
@@ -5045,6 +5046,16 @@ public class ComposeMessageActivity extends Activity
                     }
                     break;
                 case MESSAGE_LIST_QUERY_TOKEN:
+                    if (cursor != null && !cursor.isClosed()) {
+                        try {
+                            cursor.moveToLast();
+                        } catch(IllegalStateException e) {
+                            cursor.close();
+                            Log.e(TAG, "Bad cursor.", e);
+                            return;
+                        }
+                    }
+
                     mConversation.blockMarkAsRead(false);
 
                     // check consistency between the query result and 'mConversation'
