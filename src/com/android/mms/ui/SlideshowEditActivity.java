@@ -39,6 +39,7 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import com.android.mms.LogTag;
+import com.android.mms.MmsConfig;
 import com.android.mms.R;
 import com.android.mms.model.IModelChangedObserver;
 import com.android.mms.model.Model;
@@ -69,6 +70,7 @@ public class SlideshowEditActivity extends ListActivity {
     private final static String STATE = "state";
     private final static String SLIDE_INDEX = "slide_index";
     private final static String MESSAGE_URI = "message_uri";
+    private final static String MSG_SUBJECT_SIZE = "subject_size";
 
     private ListView mList;
     private SlideListAdapter mSlideListAdapter;
@@ -90,6 +92,8 @@ public class SlideshowEditActivity extends ListActivity {
         mAddSlideItem = createAddSlideItem();
         mList.addFooterView(mAddSlideItem);
         mAddSlideItem.setVisibility(View.GONE);
+
+        getActionBar().setTitle(R.string.edit_slideshow_activity);
 
         if (icicle != null) {
             // Retrieve previously saved state of this activity.
@@ -131,12 +135,12 @@ public class SlideshowEditActivity extends ListActivity {
         TextView text = (TextView) v.findViewById(R.id.slide_number_text);
         text.setText(R.string.add_slide);
 
-        text = (TextView) v.findViewById(R.id.text_preview);
+        text = (TextView) v.findViewById(R.id.text_preview_bottom);
         text.setText(R.string.add_slide_hint);
         text.setVisibility(View.VISIBLE);
 
         ImageView image = (ImageView) v.findViewById(R.id.image_preview);
-        image.setImageResource(R.drawable.ic_attach_slideshow_holo_light);
+        image.setVisibility(View.INVISIBLE);
 
         return v;
     }
@@ -239,12 +243,13 @@ public class SlideshowEditActivity extends ListActivity {
                         R.drawable.ic_menu_move_down);
             }
 
-            menu.add(0, MENU_ADD_SLIDE, 0, R.string.add_slide).setIcon(R.drawable.ic_menu_add_slide);
-
             menu.add(0, MENU_REMOVE_SLIDE, 0, R.string.remove_slide).setIcon(
                     android.R.drawable.ic_menu_delete);
-        } else {
-            menu.add(0, MENU_ADD_SLIDE, 0, R.string.add_slide).setIcon(R.drawable.ic_menu_add_slide);
+        }
+
+        if(mSlideshowModel.size() < MmsConfig.getMaxSlideNumber()) {
+            menu.add(0, MENU_ADD_SLIDE, 0, R.string.add_slide).setIcon(
+                    R.drawable.ic_menu_add_slide);
         }
 
         menu.add(0, MENU_DISCARD_SLIDESHOW, 0,
@@ -296,11 +301,12 @@ public class SlideshowEditActivity extends ListActivity {
         Intent intent = new Intent(this, SlideEditorActivity.class);
         intent.setData(mUri);
         intent.putExtra(SlideEditorActivity.SLIDE_INDEX, index);
+        intent.putExtra(MSG_SUBJECT_SIZE, getIntent().getIntExtra(MSG_SUBJECT_SIZE, 0));
         startActivityForResult(intent, REQUEST_CODE_EDIT_SLIDE);
     }
 
     private void adjustAddSlideVisibility() {
-        if (mSlideshowModel.size() >= SlideshowEditor.MAX_SLIDE_NUM) {
+        if (mSlideshowModel.size() >= MmsConfig.getMaxSlideNumber()) {
             mAddSlideItem.setVisibility(View.GONE);
         } else {
             mAddSlideItem.setVisibility(View.VISIBLE);

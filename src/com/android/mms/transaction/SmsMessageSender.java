@@ -27,9 +27,12 @@ import android.net.Uri;
 import android.preference.PreferenceManager;
 import android.provider.Telephony.Sms;
 import android.provider.Telephony.Sms.Inbox;
+import android.telephony.SubscriptionManager;
+import android.telephony.TelephonyManager;
 import android.util.Log;
 
 import com.android.mms.LogTag;
+import com.android.mms.ui.MessageUtils;
 import com.android.mms.ui.MessagingPreferenceActivity;
 import com.google.android.mms.MmsException;
 
@@ -42,6 +45,8 @@ public class SmsMessageSender implements MessageSender {
     protected final long mThreadId;
     protected long mTimestamp;
     private static final String TAG = LogTag.TAG;
+    protected int mPhoneId;
+    protected int mSubId;
 
     // Default preference values
     private static final boolean DEFAULT_DELIVERY_REPORT_MODE  = false;
@@ -54,7 +59,8 @@ public class SmsMessageSender implements MessageSender {
     private static final int COLUMN_REPLY_PATH_PRESENT = 0;
     private static final int COLUMN_SERVICE_CENTER     = 1;
 
-    public SmsMessageSender(Context context, String[] dests, String msgText, long threadId) {
+    public SmsMessageSender(Context context, String[] dests,
+                 String msgText, long threadId, int subId) {
         mContext = context;
         mMessageText = msgText;
         if (dests != null) {
@@ -68,6 +74,8 @@ public class SmsMessageSender implements MessageSender {
         mTimestamp = System.currentTimeMillis();
         mThreadId = threadId;
         mServiceCenter = getOutgoingServiceCenter(mThreadId);
+        mSubId = subId;
+        mPhoneId = SubscriptionManager.getPhoneId(subId);
     }
 
     public boolean sendMessage(long token) throws MmsException {
@@ -83,21 +91,43 @@ public class SmsMessageSender implements MessageSender {
         }
 
         SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(mContext);
-        boolean requestDeliveryReport = prefs.getBoolean(
-                MessagingPreferenceActivity.SMS_DELIVERY_REPORT_MODE,
-                DEFAULT_DELIVERY_REPORT_MODE);
+        boolean requestDeliveryReport = false;
+        if (TelephonyManager.getDefault().isMultiSimEnabled()) {
+            requestDeliveryReport = prefs.getBoolean((mPhoneId == 0) ?
+                    MessagingPreferenceActivity.SMS_DELIVERY_REPORT_SUB1 :
+                    MessagingPreferenceActivity.SMS_DELIVERY_REPORT_SUB2,
+                    DEFAULT_DELIVERY_REPORT_MODE);
+        } else {
+            requestDeliveryReport = prefs.getBoolean(
+                    MessagingPreferenceActivity.SMS_DELIVERY_REPORT_MODE,
+                    DEFAULT_DELIVERY_REPORT_MODE);
+        }
+
+        int priority = -1;
+        try {
+            String priorityStr = PreferenceManager.getDefaultSharedPreferences(mContext).getString(
+                    "pref_key_sms_cdma_priority", "");
+            priority = Integer.parseInt(priorityStr);
+        } catch (Exception e) {
+            Log.w(TAG, "get priority error:" + e);
+        }
 
         for (int i = 0; i < mNumberOfDests; i++) {
             try {
                 if (LogTag.DEBUG_SEND) {
                     Log.v(TAG, "queueMessage mDests[i]: " + mDests[i] + " mThreadId: " + mThreadId);
                 }
-                Sms.addMessageToUri(mContext.getContentResolver(),
+                // Check to see whether short message count is up to 2000 for cmcc
+                if (MessageUtils.checkIsPhoneMessageFull(mContext)) {
+                    break;
+                }
+                log("updating Database with phoneId = " + mPhoneId);
+                Sms.addMessageToUri(mSubId, mContext.getContentResolver(),
                         Uri.parse("content://sms/queued"), mDests[i],
                         mMessageText, null, mTimestamp,
                         true /* read */,
                         requestDeliveryReport,
-                        mThreadId);
+                        mThreadId, priority);
             } catch (SQLiteException e) {
                 if (LogTag.DEBUG_SEND) {
                     Log.e(TAG, "queueMessage SQLiteException", e);

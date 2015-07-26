@@ -132,10 +132,7 @@ public class MediaModelFactory {
 
         String contentType = new String(bytes);
         MediaModel media = null;
-        if (tag.equals(SmilHelper.ELEMENT_TAG_TEXT)) {
-            media = new TextModel(context, contentType, src,
-                    part.getCharset(), part.getData(), regionModel);
-        } else if (tag.equals(SmilHelper.ELEMENT_TAG_IMAGE)) {
+        if (tag.equals(SmilHelper.ELEMENT_TAG_IMAGE)) {
             media = new ImageModel(context, contentType, src,
                     part.getDataUri(), regionModel);
         } else if (tag.equals(SmilHelper.ELEMENT_TAG_VIDEO)) {
@@ -144,8 +141,11 @@ public class MediaModelFactory {
         } else if (tag.equals(SmilHelper.ELEMENT_TAG_AUDIO)) {
             media = new AudioModel(context, contentType, src,
                     part.getDataUri());
-        } else if (tag.equals(SmilHelper.ELEMENT_TAG_REF)) {
-            if (ContentType.isTextType(contentType)) {
+        } else if (tag.equals(SmilHelper.ELEMENT_TAG_REF) ||
+                tag.equals(SmilHelper.ELEMENT_TAG_TEXT)) {
+            if (ContentType.isTextType(contentType)
+                && !contentType.toLowerCase().equals(ContentType.TEXT_VCARD.toLowerCase())
+                && !contentType.toLowerCase().equals(ContentType.TEXT_VCALENDAR.toLowerCase())) {
                 media = new TextModel(context, contentType, src,
                         part.getCharset(), part.getData(), regionModel);
             } else if (ContentType.isImageType(contentType)) {
@@ -157,11 +157,24 @@ public class MediaModelFactory {
             } else if (ContentType.isAudioType(contentType)) {
                 media = new AudioModel(context, contentType, src,
                         part.getDataUri());
+            } else if (contentType.toLowerCase().equals(ContentType.TEXT_VCARD.toLowerCase())) {
+                media = new VcardModel(context, contentType, src,
+                        part.getDataUri());
+            } else if (contentType.toLowerCase().equals(ContentType.TEXT_VCALENDAR.toLowerCase())) {
+                media = new VCalModel(context, contentType, src,
+                        part.getDataUri());
             } else {
                 Log.d(TAG, "[MediaModelFactory] getGenericMediaModel Unsupported Content-Type: "
                         + contentType);
                 media = createEmptyTextModel(context, regionModel);
             }
+        } else if (tag.toLowerCase().contains("vcard")) {
+            /**
+             *  Caused by the SMIL doesn't support the tag named as 'vcard', but maybe someone will
+             *  use it to share the vcard, so we need to deal with the tag contains 'vcard'.
+             */
+            media = new VcardModel(context, ContentType.TEXT_VCARD, src,
+                    part.getDataUri());
         } else {
             throw new IllegalArgumentException("Unsupported TAG: " + tag);
         }

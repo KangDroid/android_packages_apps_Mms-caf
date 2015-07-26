@@ -5,11 +5,14 @@ import java.util.ArrayList;
 import android.app.PendingIntent;
 import android.content.Context;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.net.Uri;
+import android.preference.PreferenceManager;
 import android.provider.Telephony.Mms;
 import android.provider.Telephony.Sms;
 import android.telephony.PhoneNumberUtils;
 import android.telephony.SmsManager;
+import android.telephony.SubscriptionManager;
 import android.util.Log;
 
 import com.android.mms.LogTag;
@@ -24,13 +27,18 @@ public class SmsSingleRecipientSender extends SmsMessageSender {
     private String mDest;
     private Uri mUri;
     private static final String TAG = LogTag.TAG;
+    private int mPriority = -1;
 
     public SmsSingleRecipientSender(Context context, String dest, String msgText, long threadId,
-            boolean requestDeliveryReport, Uri uri) {
-        super(context, null, msgText, threadId);
+            boolean requestDeliveryReport, Uri uri, int subId) {
+        super(context, null, msgText, threadId, subId);
         mRequestDeliveryReport = requestDeliveryReport;
         mDest = dest;
         mUri = uri;
+    }
+
+    public void setPriority(int priority) {
+        this.mPriority = priority;
     }
 
     public boolean sendMessage(long token) throws MmsException {
@@ -42,7 +50,7 @@ public class SmsSingleRecipientSender extends SmsMessageSender {
             // one.
             throw new MmsException("Null message body or have multiple destinations.");
         }
-        SmsManager smsManager = SmsManager.getDefault();
+        SmsManager smsManager = SmsManager.getSmsManagerForSubscriptionId(mSubId);
         ArrayList<String> messages = null;
         if ((MmsConfig.getEmailGateway() != null) &&
                 (Mms.isEmailAddress(mDest) || MessageUtils.isAlias(mDest))) {
@@ -57,6 +65,7 @@ public class SmsSingleRecipientSender extends SmsMessageSender {
             // (e.g. "+8211-123-4567" -> "+82111234567")
             mDest = PhoneNumberUtils.stripSeparators(mDest);
             mDest = Conversation.verifySingleRecipient(mContext, mThreadId, mDest);
+            mDest = MessageUtils.checkIdp(mContext, mDest, mSubId);
         }
         int messageCount = messages.size();
 
@@ -112,18 +121,48 @@ public class SmsSingleRecipientSender extends SmsMessageSender {
             }
             sentIntents.add(PendingIntent.getBroadcast(mContext, requestCode, intent, 0));
         }
+
+        int validityPeriod = getValidityPeriod(mPhoneId);
+        Log.d(TAG, "sendMessage validityPeriod = "+validityPeriod);
+        // Remove all attributes for CDMA international roaming.
+        if (MessageUtils.isCDMAInternationalRoaming(mSubId)) {
+            Log.v(TAG, "sendMessage during CDMA international roaming.");
+            mPriority = -1;
+            deliveryIntents = null;
+            validityPeriod = -1;
+        }
         try {
-            smsManager.sendMultipartTextMessage(mDest, mServiceCenter, messages, sentIntents, deliveryIntents);
+            smsManager.sendMultipartTextMessage(mDest, mServiceCenter, messages,
+                    sentIntents, deliveryIntents, mPriority, false, validityPeriod);
         } catch (Exception ex) {
             Log.e(TAG, "SmsMessageSender.sendMessage: caught", ex);
             throw new MmsException("SmsMessageSender.sendMessage: caught " + ex +
-                    " from SmsManager.sendTextMessage()");
+                    " from SmsManager.sendMultipartTextMessage()");
         }
         if (Log.isLoggable(LogTag.TRANSACTION, Log.VERBOSE) || LogTag.DEBUG_SEND) {
             log("sendMessage: address=" + mDest + ", threadId=" + mThreadId +
                     ", uri=" + mUri + ", msgs.count=" + messageCount);
         }
         return false;
+    }
+
+    private int getValidityPeriod(int slot) {
+        SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(mContext);
+        String valitidyPeriod = null;
+        switch (slot) {
+            case MessageUtils.SUB_INVALID:
+                valitidyPeriod = prefs.getString("pref_key_sms_validity_period", null);
+                break;
+            case MessageUtils.SUB1:
+                valitidyPeriod = prefs.getString("pref_key_sms_validity_period_slot1", null);
+                break;
+            case MessageUtils.SUB2:
+                valitidyPeriod = prefs.getString("pref_key_sms_validity_period_slot2", null);
+                break;
+            default:
+                break;
+        }
+        return (valitidyPeriod == null) ? -1 : Integer.parseInt(valitidyPeriod);
     }
 
     private void log(String msg) {

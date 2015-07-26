@@ -18,11 +18,14 @@
 package com.android.mms.ui;
 
 import android.content.Context;
+import android.graphics.Bitmap;
 import android.os.Handler;
+import android.os.Message;
 import android.util.Log;
 
 import com.android.mms.LogTag;
 import com.android.mms.model.AudioModel;
+import com.android.mms.model.VCalModel;
 import com.android.mms.model.ImageModel;
 import com.android.mms.model.LayoutModel;
 import com.android.mms.model.MediaModel;
@@ -33,9 +36,12 @@ import com.android.mms.model.RegionModel;
 import com.android.mms.model.SlideModel;
 import com.android.mms.model.SlideshowModel;
 import com.android.mms.model.TextModel;
+import com.android.mms.model.VcardModel;
 import com.android.mms.model.VideoModel;
 import com.android.mms.ui.AdaptableSlideViewInterface.OnSizeChangedListener;
 import com.android.mms.util.ItemLoadedCallback;
+import android.net.Uri;
+import android.text.TextUtils;
 
 /**
  * A basic presenter of slides.
@@ -129,6 +135,12 @@ public class SlideshowPresenter extends Presenter {
                 presentRegionMedia(view, (RegionMediaModel) media, true);
             } else if (media.isAudio()) {
                 presentAudio(view, (AudioModel) media, true);
+            } else if (media.isVcard()) {
+                // the media is vcard.
+                presentVcard(view, (VcardModel) media, true);
+            } else if (media.isVCal()) {
+                // the media is a vCal file.
+                presentVCal(view, (VCalModel) media, true);
             }
         }
     }
@@ -167,6 +179,28 @@ public class SlideshowPresenter extends Presenter {
         }
     }
 
+    protected void presentVcard(SlideViewInterface view, VcardModel vcard, boolean dataChanged) {
+        if (dataChanged) {
+            view.setVcard(
+                    TextUtils.isEmpty(vcard.getLookupUri()) ? null
+                            : Uri.parse(vcard.getLookupUri()), vcard.getSrc());
+        }
+        if (view instanceof SlideListItemView) {
+            SlideListItemView item = (SlideListItemView) view;
+            item.setVcard(vcard.getUri(), vcard.getLookupUri(), vcard.getSrc());
+        }
+    }
+
+    protected void presentVCal(SlideViewInterface view, VCalModel vcalModel, boolean dataChanged) {
+        if (dataChanged) {
+            view.setVCal(vcalModel.getUri(), vcalModel.getSrc());
+        }
+        if (view instanceof SlideListItemView) {
+            SlideListItemView item = (SlideListItemView) view;
+            item.setVCal(vcalModel.getUri(), vcalModel.getSrc());
+        }
+    }
+
     protected void presentText(SlideViewInterface view, TextModel text,
             RegionModel r, boolean dataChanged) {
         if (dataChanged) {
@@ -188,20 +222,47 @@ public class SlideshowPresenter extends Presenter {
      * @param image
      * @param r
      */
-    protected void presentImage(SlideViewInterface view, ImageModel image,
+    protected void presentImage(final SlideViewInterface view, final ImageModel image,
             RegionModel r, boolean dataChanged) {
-        int transformedWidth = transformWidth(r.getWidth());
-        int transformedHeight = transformWidth(r.getHeight());
+        final int transformedWidth = transformWidth(r.getWidth());
+        final int transformedHeight = transformWidth(r.getHeight());
+        final int normalSlideH = (int)((float)transformedHeight * mHeightTransformRatio / 2);
+        final int normalSlideW = (int)((float)transformedWidth * mWidthTransformRatio / 2);
 
         if (LOCAL_LOGV) {
             Log.v(TAG, "presentImage r.getWidth: " + r.getWidth()
                     + ", r.getHeight: " + r.getHeight() +
+                    " normalSlideW: " + normalSlideW +
+                    " normalSlideH: " + normalSlideH+
                     " transformedWidth: " + transformedWidth +
                     " transformedHeight: " + transformedHeight);
         }
 
         if (dataChanged) {
-            view.setImage(image.getSrc(), image.getBitmap(transformedWidth, transformedHeight));
+            final Handler bitmapHandler = new Handler() {
+                @Override
+                public void handleMessage(Message message) {
+                    if (view instanceof SlideListItemView) {
+                            SlideListItemView item = (SlideListItemView) view;
+                            item.setUri(image.getUri());
+                    }
+                    view.setImage(image.getSrc(), (Bitmap)message.obj);
+                }
+            };
+            Thread bitmapLoaderThread = new Thread() {
+                @Override
+                public void run() {
+                    Bitmap drawable;
+                    if (view instanceof SlideListItemView) {
+                        drawable = image.getBitmap(normalSlideW, normalSlideH);
+                    } else {
+                        drawable = image.getBitmap(transformedWidth, transformedHeight);
+                    }
+                    Message message = bitmapHandler.obtainMessage(1, drawable);
+                    bitmapHandler.sendMessage(message);
+                }
+            };
+            bitmapLoaderThread.start();
         }
 
         if (view instanceof AdaptableSlideViewInterface) {

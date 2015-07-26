@@ -40,10 +40,12 @@ import android.view.MotionEvent;
 import android.view.View;
 import android.view.inputmethod.EditorInfo;
 import android.widget.AdapterView;
+import android.widget.ImageView;
 import android.widget.MultiAutoCompleteTextView;
 
 import com.android.ex.chips.DropdownChipLayouter;
 import com.android.ex.chips.RecipientEditTextView;
+import com.android.ex.chips.RecipientEntry;
 import com.android.mms.MmsConfig;
 import com.android.mms.R;
 import com.android.mms.data.Contact;
@@ -53,11 +55,15 @@ import com.android.mms.data.ContactList;
  * Provide UI for editing the recipients of multi-media messages.
  */
 public class RecipientsEditor extends RecipientEditTextView {
+    private static final char SBC_CHAR_START = 65281;
+    private static final char SBC_CHAR_END = 65373;
+
     private int mLongPressedPosition = -1;
     private final RecipientsEditorTokenizer mTokenizer;
     private char mLastSeparator = ',';
     private Runnable mOnSelectChipRunnable;
     private final AddressValidator mInternalValidator;
+    private Context mContext;
 
     /** A noop validator that does not munge invalid texts and claims any address is valid */
     private class AddressValidator implements Validator {
@@ -73,6 +79,7 @@ public class RecipientsEditor extends RecipientEditTextView {
     public RecipientsEditor(Context context, AttributeSet attrs) {
         super(context, attrs);
 
+        mContext = context;
         mTokenizer = new RecipientsEditorTokenizer();
         setTokenizer(mTokenizer);
 
@@ -132,6 +139,11 @@ public class RecipientsEditor extends RecipientEditTextView {
             protected int getItemLayoutResId(AdapterType type) {
                 return R.layout.mms_chips_recipient_dropdown_item;
             }
+
+            @Override
+            protected int getAlternateItemLayoutResId(AdapterType type) {
+                return R.layout.mms_chips_recipient_dropdown_item;
+            }
         });
     }
 
@@ -173,6 +185,10 @@ public class RecipientsEditor extends RecipientEditTextView {
         return mTokenizer.getNumbers();
     }
 
+    public String getExsitNumbers(){
+        return mTokenizer.getNumbersString();
+    }
+
     public ContactList constructContactsFromInput(boolean blocking) {
         List<String> numbers = mTokenizer.getNumbers();
         ContactList list = new ContactList();
@@ -188,6 +204,10 @@ public class RecipientsEditor extends RecipientEditTextView {
         if (isMms) {
             return MessageUtils.isValidMmsAddress(number);
         } else {
+            if (hasInvalidCharacter(number)) {
+                return false;
+            }
+
             // TODO: PhoneNumberUtils.isWellFormedSmsAddress() only check if the number is a valid
             // GSM SMS address. If the address contains a dialable char, it considers it a well
             // formed SMS addr. CDMA doesn't work that way and has a different parser for SMS
@@ -197,12 +217,61 @@ public class RecipientsEditor extends RecipientEditTextView {
         }
     }
 
-    public boolean hasValidRecipient(boolean isMms) {
-        for (String number : mTokenizer.getNumbers()) {
-            if (isValidAddress(number, isMms))
-                return true;
+    /**
+     * Return true if the number contains invalid character.
+     */
+    private boolean hasInvalidCharacter(String number) {
+        char[] charNumber = number.trim().toCharArray();
+        int count = charNumber.length;
+        if (mContext.getResources().getBoolean(R.bool.config_filter_char_address)) {
+            for (int i = 0; i < count; i++) {
+                // Allow first character is + character
+                if (i == 0 && charNumber[i] == '+') {
+                    continue;
+                }
+                if (!isValidCharacter(charNumber[i])) {
+                    return true;
+                }
+            }
+        } else {
+            for (int i = 0; i < count; i++) {
+                if (isSBCCharacter(charNumber, i)) {
+                    return true;
+                }
+            }
         }
         return false;
+    }
+
+    /**
+    * Return true if the charNumber belongs full-width characters
+    */
+    private boolean isSBCCharacter(char[] charNumber, int i) {
+        return charNumber[i] >= SBC_CHAR_START && charNumber[i] <= SBC_CHAR_END;
+    }
+
+    private boolean isValidCharacter(char c) {
+        return (c >= '0' && c <= '9') || c == '-' || c == '(' || c == ')' || c == ' ';
+    }
+
+    public int getValidRecipientsCount(boolean isMms) {
+        int validNum = 0;
+        int invalidNum = 0;
+        for (String number : mTokenizer.getNumbers()) {
+            if (isValidAddress(number, isMms)) {
+                validNum++;
+            } else {
+                invalidNum++;
+            }
+        }
+        int count = mTokenizer.getNumbers().size();
+        if (validNum == count) {
+            return MessageUtils.ALL_RECIPIENTS_VALID;
+        } else if (invalidNum == count) {
+            return MessageUtils.ALL_RECIPIENTS_INVALID;
+        }
+        return invalidNum;
+
     }
 
     public boolean hasInvalidRecipient(boolean isMms) {
@@ -279,12 +348,38 @@ public class RecipientsEditor extends RecipientEditTextView {
         if (list.size() == 0) {
             // The base class RecipientEditTextView will ignore empty text. That's why we need
             // this special case.
-            setText(null);
+            post(new Runnable() {
+                @Override
+                public void run() {
+                    setText(null);
+                }
+            });
         } else {
+            post(new Runnable() {
+                @Override
+                public void run() {
+                    // Clear the recipient when add contact again
+                    setText("");
+                }
+            });
+
             for (Contact c : list) {
                 // Calling setText to set the recipients won't create chips,
                 // but calling append() will.
-                append(contactToToken(c) + ",");
+
+                // Need to judge  whether contactToToken(c) return valid data,if it is not,
+                // do not append it so that the comma can not be displayed.
+                final CharSequence charSequence = contactToToken(c);
+
+                if (charSequence != null && charSequence.length() > 0) {
+                    post(new Runnable() {
+                        @Override
+                        public void run() {
+                            append(charSequence + ", ");
+                        }
+                    });
+
+                }
             }
         }
     }
@@ -396,6 +491,9 @@ public class RecipientsEditor extends RecipientEditTextView {
     private class RecipientsEditorTokenizer
             implements MultiAutoCompleteTextView.Tokenizer {
 
+        private Spanned mPreviousSpanned;
+        private ArrayList<String> mPreviousSpannedNumbers;
+
         @Override
         public int findTokenStart(CharSequence text, int cursor) {
             int i = cursor;
@@ -410,6 +508,10 @@ public class RecipientsEditor extends RecipientEditTextView {
                 i--;
             }
             while (i < cursor && text.charAt(i) == ' ') {
+                i++;
+            }
+            //filter Full width space
+            while (i < cursor && text.charAt(i) == '\u3000') {
                 i++;
             }
 
@@ -461,8 +563,13 @@ public class RecipientsEditor extends RecipientEditTextView {
 
         public List<String> getNumbers() {
             Spanned sp = RecipientsEditor.this.getText();
+
+            if (mPreviousSpanned != null && mPreviousSpanned.equals(sp)) {
+                return (List<String>)mPreviousSpannedNumbers.clone();
+            }
+
             int len = sp.length();
-            List<String> list = new ArrayList<String>();
+            ArrayList<String> list = new ArrayList<String>();
 
             int start = 0;
             int i = 0;
@@ -472,9 +579,12 @@ public class RecipientsEditor extends RecipientEditTextView {
                     if (i > start) {
                         list.add(getNumberAt(sp, start, i, getContext()));
 
-                        // calculate the recipients total length. This is so if the name contains
-                        // commas or semis, we'll skip over the whole name to the next
-                        // recipient, rather than parsing this single name into multiple
+                        // calculate the recipients total length. This is so if
+                        // the name contains
+                        // commas or semis, we'll skip over the whole name to
+                        // the next
+                        // recipient, rather than parsing this single name into
+                        // multiple
                         // recipients.
                         int spanLen = getSpanLength(sp, start, i, getContext());
                         if (spanLen > i) {
@@ -494,7 +604,49 @@ public class RecipientsEditor extends RecipientEditTextView {
                 }
             }
 
+            mPreviousSpanned = sp;
+            mPreviousSpannedNumbers = list;
+
             return list;
+        }
+
+        public String getNumbersString() {
+            Spanned sp = RecipientsEditor.this.getText();
+            int len = sp.length();
+            StringBuilder sb = new StringBuilder();
+            int start = 0;
+            int i = 0;
+            while (i < len + 1) {
+                char c;
+                if ((i == len) || ((c = sp.charAt(i)) == ',') || (c == ';')) {
+                    if (i > start) {
+                        sb.append("'" + getNumberAt(sp, start, i, mContext) + "',");
+                        // calculate the recipients total length. This is so if
+                        // the name contains
+                        // commas or semis, we'll skip over the whole name to
+                        // the next
+                        // recipient, rather than parsing this single name into
+                        // multiple
+                        // recipients.
+                        int spanLen = getSpanLength(sp, start, i, mContext);
+                        if (spanLen > i) {
+                            i = spanLen;
+                        }
+                    }
+
+                    i++;
+
+                    while ((i < len) && (sp.charAt(i) == ' ')) {
+                        i++;
+                    }
+
+                    start = i;
+                } else {
+                    i++;
+                }
+            }
+
+            return (sb.length() != 0) ? (sb.deleteCharAt(sb.length() - 1).toString()) : null;
         }
     }
 

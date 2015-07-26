@@ -18,6 +18,7 @@
 package com.android.mms.transaction;
 
 import android.content.ContentUris;
+import android.content.ContentResolver;
 import android.content.ContentValues;
 import android.content.Context;
 import android.content.Intent;
@@ -27,8 +28,11 @@ import android.preference.PreferenceManager;
 import android.provider.Telephony.Mms;
 import android.provider.Telephony.MmsSms;
 import android.provider.Telephony.MmsSms.PendingMessages;
+import android.telephony.SubscriptionManager;
+import android.telephony.TelephonyManager;
 import android.util.Log;
 
+import com.android.internal.telephony.PhoneConstants;
 import com.android.mms.LogTag;
 import com.android.mms.ui.ComposeMessageActivity;
 import com.android.mms.ui.MessagingPreferenceActivity;
@@ -49,6 +53,8 @@ public class MmsMessageSender implements MessageSender {
     private final Context mContext;
     private final Uri mMessageUri;
     private final long mMessageSize;
+    private int mSubId;
+    private int mPhoneId;
 
     // Default preference values
     private static final boolean DEFAULT_DELIVERY_REPORT_MODE  = false;
@@ -57,11 +63,12 @@ public class MmsMessageSender implements MessageSender {
     private static final int     DEFAULT_PRIORITY        = PduHeaders.PRIORITY_NORMAL;
     private static final String  DEFAULT_MESSAGE_CLASS   = PduHeaders.MESSAGE_CLASS_PERSONAL_STR;
 
-    public MmsMessageSender(Context context, Uri location, long messageSize) {
+    public MmsMessageSender(Context context, Uri location, long messageSize, int subId) {
         mContext = context;
         mMessageUri = location;
         mMessageSize = messageSize;
-
+        mSubId = subId;
+        mPhoneId = SubscriptionManager.getPhoneId(subId);
         if (mMessageUri == null) {
             throw new IllegalArgumentException("Null message URI.");
         }
@@ -95,6 +102,7 @@ public class MmsMessageSender implements MessageSender {
         p.updateHeaders(mMessageUri, sendReq);
 
         long messageId = ContentUris.parseId(mMessageUri);
+        final ContentResolver resolver = mContext.getContentResolver();
 
         // Move the message into MMS Outbox.
         if (!mMessageUri.toString().startsWith(Mms.Draft.CONTENT_URI.toString())) {
@@ -103,7 +111,7 @@ public class MmsMessageSender implements MessageSender {
             // entry in the pending_msgs table which is where TransacationService looks for
             // messages to send. Normally, the entry in pending_msgs is created by the trigger:
             // insert_mms_pending_on_update, when a message is moved from drafts to the outbox.
-            ContentValues values = new ContentValues(7);
+            ContentValues values = new ContentValues(9);
 
             values.put(PendingMessages.PROTO_TYPE, MmsSms.MMS_PROTO);
             values.put(PendingMessages.MSG_ID, messageId);
@@ -112,16 +120,20 @@ public class MmsMessageSender implements MessageSender {
             values.put(PendingMessages.ERROR_CODE, 0);
             values.put(PendingMessages.RETRY_INDEX, 0);
             values.put(PendingMessages.DUE_TIME, 0);
+            values.put(PendingMessages.SUBSCRIPTION_ID, mSubId);
+            values.put(PendingMessages.PHONE_ID, mPhoneId);
 
-            SqliteWrapper.insert(mContext, mContext.getContentResolver(),
-                    PendingMessages.CONTENT_URI, values);
+            SqliteWrapper.insert(mContext, resolver, PendingMessages.CONTENT_URI, values);
         } else {
             p.move(mMessageUri, Mms.Outbox.CONTENT_URI);
+            updatePendingMessageSubscriptionId(mContext, messageId, mSubId);
         }
 
         // Start MMS transaction service
         SendingProgressTokenManager.put(messageId, token);
-        mContext.startService(new Intent(mContext, TransactionService.class));
+        Intent intent = new Intent(mContext, TransactionService.class);
+        intent.putExtra(PhoneConstants.SUBSCRIPTION_KEY, mSubId);
+        mContext.startService(intent);
 
         return true;
     }
@@ -131,8 +143,15 @@ public class MmsMessageSender implements MessageSender {
         SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(mContext);
 
         // Expiry.
-        sendReq.setExpiry(prefs.getLong(
-                MessagingPreferenceActivity.EXPIRY_TIME, DEFAULT_EXPIRY_TIME));
+        long expiryTime = getExpiryTime(prefs);
+
+        String expiryStr = prefs.getString(MessagingPreferenceActivity.EXPIRY_TIME, "0");
+        Log.v(TAG, "updatePreferencesHeaders expiryTime = " + expiryTime + ", expiryStr = "
+                + expiryStr);
+        if (0 != expiryTime) {
+            // Add for sub , if don't set , net will set to Maxinum to default
+            sendReq.setExpiry(expiryTime);
+        }
 
         // Priority.
         sendReq.setPriority(prefs.getInt(MessagingPreferenceActivity.PRIORITY, DEFAULT_PRIORITY));
@@ -148,7 +167,22 @@ public class MmsMessageSender implements MessageSender {
         sendReq.setReadReport(rr?PduHeaders.VALUE_YES:PduHeaders.VALUE_NO);
     }
 
-    public static void sendReadRec(Context context, String to, String messageId, int status) {
+    private long getExpiryTime(SharedPreferences prefs) {
+        long expiryTime = 0;
+        if (TelephonyManager.getDefault().isMultiSimEnabled()) {
+            expiryTime = Long.parseLong(
+                    prefs.getString((mPhoneId == 0) ?
+                            MessagingPreferenceActivity.EXPIRY_TIME_SLOT1:
+                            MessagingPreferenceActivity.EXPIRY_TIME_SLOT2, "0"));
+        } else {
+            expiryTime = Long.parseLong(
+                    prefs.getString(MessagingPreferenceActivity.EXPIRY_TIME, "0"));
+        }
+        return expiryTime;
+    }
+
+    public static void sendReadRec(Context context, String to, String messageId,
+            int subId, int status) {
         EncodedStringValue[] sender = new EncodedStringValue[1];
         sender[0] = new EncodedStringValue(to);
 
@@ -162,13 +196,24 @@ public class MmsMessageSender implements MessageSender {
 
             readRec.setDate(System.currentTimeMillis() / 1000);
 
-            PduPersister.getPduPersister(context).persist(readRec, Mms.Outbox.CONTENT_URI, true,
+            PduPersister persister = PduPersister.getPduPersister(context);
+            Uri uri = persister.persist(readRec, Mms.Outbox.CONTENT_URI, true,
                     MessagingPreferenceActivity.getIsGroupMmsEnabled(context), null);
+            updatePendingMessageSubscriptionId(context, ContentUris.parseId(uri), subId);
             context.startService(new Intent(context, TransactionService.class));
         } catch (InvalidHeaderValueException e) {
             Log.e(TAG, "Invalide header value", e);
         } catch (MmsException e) {
             Log.e(TAG, "Persist message failed", e);
         }
+    }
+
+    private static void updatePendingMessageSubscriptionId(Context context,
+            long messageId, int subId) {
+        ContentValues values = new ContentValues(2);
+        values.put(PendingMessages.SUBSCRIPTION_ID, subId);
+        values.put(PendingMessages.PHONE_ID, SubscriptionManager.getPhoneId(subId));
+        SqliteWrapper.update(context, context.getContentResolver(), PendingMessages.CONTENT_URI,
+                values, PendingMessages.MSG_ID + "=" + messageId, null);
     }
 }

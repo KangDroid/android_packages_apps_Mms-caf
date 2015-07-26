@@ -30,12 +30,18 @@
         android:text="@string/download"
         android:visibility="gone" />
 
+    <Button android:id="@+id/btn_cancel_download"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="center_vertical"
+        android:text="@string/cancel_downloading"
+        android:visibility="gone" />
+
     <TextView android:id="@+id/label_downloading"
         android:layout_width="wrap_content"
-        android:layout_height="match_parent"
-        android:layout_marginLeft="5dp"
-        android:layout_marginRight="5dp"
-        android:gravity="center"
+        android:layout_height="wrap_content"
+        android:gravity="center_vertical"
+        android:textAppearance="@android:style/TextAppearance.Material.Subhead"
         android:text="@string/downloading" 
         android:visibility="gone" />
 

@@ -35,10 +35,12 @@ import android.os.SystemClock;
 import android.provider.Telephony.Sms;
 import android.provider.Telephony.Sms.Inbox;
 import android.telephony.SmsMessage;
+import android.telephony.SubscriptionManager;
 import android.text.TextUtils;
 import android.util.Log;
 import android.view.Window;
 
+import com.android.internal.telephony.PhoneConstants;
 import com.android.mms.LogTag;
 import com.android.mms.R;
 import com.android.mms.transaction.MessagingNotification;
@@ -71,6 +73,7 @@ public class ClassZeroActivity extends Activity {
     private long mTimerSet = 0;
     private AlertDialog mDialog = null;
 
+    private int mSubId;
     private ArrayList<SmsMessage> mMessageQueue = null;
 
     private Handler mHandler = new Handler() {
@@ -89,6 +92,8 @@ public class ClassZeroActivity extends Activity {
     private boolean queueMsgFromIntent(Intent msgIntent) {
         byte[] pdu = msgIntent.getByteArrayExtra("pdu");
         String format = msgIntent.getStringExtra("format");
+        mSubId = msgIntent.getIntExtra(PhoneConstants.SUBSCRIPTION_KEY,
+                SubscriptionManager.INVALID_SUBSCRIPTION_ID);
         SmsMessage rawMessage = SmsMessage.createFromPdu(pdu, format);
         String message = rawMessage.getMessageBody();
         if (TextUtils.isEmpty(message)) {
@@ -224,7 +229,7 @@ public class ClassZeroActivity extends Activity {
         // Store the message in the content provider.
         ContentValues values = new ContentValues();
 
-        values.put(Inbox.ADDRESS, sms.getDisplayOriginatingAddress());
+        values.put(Inbox.ADDRESS, MessageUtils.convertIdp(this, sms.getDisplayOriginatingAddress()));
 
         // Use now for the timestamp to avoid confusion with clock
         // drift between the handset and the SMSC.
@@ -238,6 +243,8 @@ public class ClassZeroActivity extends Activity {
         }
         values.put(Inbox.REPLY_PATH_PRESENT, sms.isReplyPathPresent() ? 1 : 0);
         values.put(Inbox.SERVICE_CENTER, sms.getServiceCenterAddress());
+        values.put(Sms.SUBSCRIPTION_ID, mSubId);
+        values.put(Sms.PHONE_ID, SubscriptionManager.getPhoneId(mSubId));
         return values;
     }
 
@@ -247,7 +254,7 @@ public class ClassZeroActivity extends Activity {
         values.put(Inbox.BODY, sms.getMessageBody());
 
         ContentResolver resolver = getContentResolver();
-        String originatingAddress = sms.getOriginatingAddress();
+        String originatingAddress = MessageUtils.convertIdp(this, sms.getOriginatingAddress());
         int protocolIdentifier = sms.getProtocolIdentifier();
         String selection = Sms.ADDRESS + " = ? AND " + Sms.PROTOCOL + " = ?";
         String[] selectionArgs = new String[] { originatingAddress,
@@ -273,6 +280,11 @@ public class ClassZeroActivity extends Activity {
     }
 
     private Uri storeMessage(SmsMessage sms) {
+        // Check to see whether short message count is up to 2000 for cmcc
+        if (MessageUtils.checkIsPhoneMessageFull(this)) {
+            return null;
+        }
+
         // Store the message in the content provider.
         ContentValues values = extractContentValues(sms);
         values.put(Inbox.BODY, sms.getDisplayMessageBody());

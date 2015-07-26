@@ -41,8 +41,10 @@ import android.view.View.OnClickListener;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.ImageButton;
+import android.widget.TextView;
 import android.widget.Toast;
 
+import com.android.mms.ContentRestrictionException;
 import com.android.mms.ExceedMessageSizeException;
 import com.android.mms.LogTag;
 import com.android.mms.MmsApp;
@@ -56,6 +58,7 @@ import com.android.mms.model.LayoutModel;
 import com.android.mms.model.Model;
 import com.android.mms.model.SlideModel;
 import com.android.mms.model.SlideshowModel;
+import com.android.mms.model.TextModel;
 import com.android.mms.ui.BasicSlideEditorView.OnTextChangedListener;
 import com.android.mms.ui.MessageUtils.ResizeImageResultCallback;
 import com.google.android.mms.ContentType;
@@ -64,13 +67,18 @@ import com.google.android.mms.pdu.PduBody;
 import com.google.android.mms.pdu.PduPart;
 import com.google.android.mms.pdu.PduPersister;
 
+import java.util.Locale;
+
 /**
  * This activity allows user to edit the contents of a slide.
  */
-public class SlideEditorActivity extends Activity {
+public class SlideEditorActivity extends Activity implements
+        NumberPickerDialog.OnNumberSetListener {
     private static final String TAG = LogTag.TAG;
     private static final boolean DEBUG = false;
     private static final boolean LOCAL_LOGV = false;
+
+    private final static String MSG_SUBJECT_SIZE = "subject_size";
 
     // Key for extra data.
     public static final String SLIDE_INDEX = "slide_index";
@@ -99,12 +107,13 @@ public class SlideEditorActivity extends Activity {
     private final static int REQUEST_CODE_CHANGE_MUSIC       = 3;
     private final static int REQUEST_CODE_RECORD_SOUND       = 4;
     private final static int REQUEST_CODE_CHANGE_VIDEO       = 5;
-    private final static int REQUEST_CODE_CHANGE_DURATION    = 6;
-    private final static int REQUEST_CODE_TAKE_VIDEO         = 7;
+    private final static int REQUEST_CODE_TAKE_VIDEO         = 6;
 
     // number of items in the duration selector dialog that directly map from
     // item index to duration in seconds (duration = index + 1)
     private final static int NUM_DIRECT_DURATIONS = 10;
+
+    private static final int KILOBYTE = 1024;
 
     private ImageButton mNextSlide;
     private ImageButton mPreSlide;
@@ -119,6 +128,8 @@ public class SlideEditorActivity extends Activity {
     private SlideshowEditor mSlideshowEditor;
     private SlideshowPresenter mPresenter;
     private boolean mDirty;
+
+    private int mSubjectSize;
 
     private int mPosition;
     private Uri mUri;
@@ -140,6 +151,13 @@ public class SlideEditorActivity extends Activity {
         mNextSlide = (ImageButton) findViewById(R.id.next_slide_button);
         mNextSlide.setOnClickListener(mOnNavigateForward);
 
+        // Change the pictures of Pre/Next for RTL.
+        if (TextUtils.getLayoutDirectionFromLocale(Locale.getDefault())
+                == View.LAYOUT_DIRECTION_RTL) {
+            mPreSlide.setImageDrawable(getResources().getDrawable(R.drawable.ic_maps_next));
+            mNextSlide.setImageDrawable(getResources().getDrawable(R.drawable.ic_maps_back));
+        }
+
         mPreview = (Button) findViewById(R.id.preview_button);
         mPreview.setOnClickListener(mOnPreview);
 
@@ -153,10 +171,15 @@ public class SlideEditorActivity extends Activity {
         mTextEditor.setFilters(new InputFilter[] {
                 new LengthFilter(MmsConfig.getMaxTextLimit())});
 
+        if (getResources().getInteger(R.integer.slide_text_limit_size) != 0) {
+            mTextEditor.setFilters(new InputFilter[] {
+                    new LengthFilter(getResources().getInteger(R.integer.slide_text_limit_size))});
+        }
         mDone = (Button) findViewById(R.id.done_button);
         mDone.setOnClickListener(mDoneClickListener);
 
         initActivityState(savedInstanceState, getIntent());
+        mSubjectSize = getIntent().getIntExtra(MSG_SUBJECT_SIZE, 0);
 
         try {
             mSlideshowModel = SlideshowModel.createFromMessageUri(this, mUri);
@@ -180,6 +203,7 @@ public class SlideEditorActivity extends Activity {
             }
 
             showCurrentSlide();
+            updateMmsSizeIndicator();
         } catch (MmsException e) {
             Log.e(TAG, "Create SlideshowModel failed!", e);
             finish();
@@ -243,6 +267,8 @@ public class SlideEditorActivity extends Activity {
                 synchronized (SlideEditorActivity.this) {
                     mDirty = true;
                 }
+                // If mSlideshowModel is changed, update the mms size indicator.
+                updateMmsSizeIndicator();
                 setResult(RESULT_OK);
             }
         };
@@ -267,9 +293,49 @@ public class SlideEditorActivity extends Activity {
     };
 
     private final OnTextChangedListener mOnTextChangedListener = new OnTextChangedListener() {
+        // Add this flag to prevent "StackOverflowError" exception.
+        private boolean mIsChanged = false;
+
         public void onTextChanged(String s) {
+            if (mIsChanged) {
+                return;
+            }
             if (!isFinishing()) {
-                mSlideshowEditor.changeText(mPosition, s);
+                TextModel textMode = mSlideshowModel.get(mPosition).getText();
+
+                // beforeInputSize is size for inputting before.
+                int beforeInputSize = textMode == null ? 0 : textMode.getText().getBytes().length;
+                // currentInputSize include size for inputting current and before.
+                int currentInputSize = s.getBytes().length;
+                // so we need re-calculate the current input size.
+                int inputSize = currentInputSize - beforeInputSize;
+
+                // Add input size which inputting current to re-calculate the remain message size.
+                int remainSize = mSlideshowModel.getRemainMessageSize() - mSubjectSize - inputSize;
+                remainSize = remainSize < 0 ? 0 : remainSize;
+                if (DEBUG) {
+                    Log.v(TAG,"remainSize = "+remainSize);
+                }
+
+                if (remainSize == 0 || (mSlideshowModel.getRemainMessageSize() + beforeInputSize)
+                        < currentInputSize) {
+                    Toast.makeText(SlideEditorActivity.this, R.string.cannot_add_text_anymore,
+                            Toast.LENGTH_SHORT).show();
+
+                    // Set mIsChanged is true before mTextEditor.setText(...),
+                    // because "setText" will invoke "onTextChanged" again and again.
+                    // And finally throw "StackOverflowError". So add this flag.
+                    mIsChanged = true;
+                    if (textMode != null) {
+                        mTextEditor.setText(textMode.getText());
+                    } else {
+                        mTextEditor.setText("");
+                    }
+                    // Set mIsChanged is false, do not affect next nomal invoke "onTextChanged".
+                    mIsChanged = false;
+                } else {
+                    mSlideshowEditor.changeText(mPosition, s);
+                }
             }
         }
     };
@@ -403,10 +469,8 @@ public class SlideEditorActivity extends Activity {
                 R.drawable.ic_menu_add_slide);
 
         // Slide duration
-        String duration = getResources().getString(R.string.duration_sec);
-        menu.add(0, MENU_DURATION, 0,
-                duration.replace("%s", String.valueOf(slide.getDuration() / 1000))).setIcon(
-                        R.drawable.ic_menu_duration);
+        String duration = getString(R.string.duration_sec, slide.getDuration() / 1000);
+        menu.add(0, MENU_DURATION, 0, duration).setIcon(R.drawable.ic_menu_duration);
 
         // Slide layout
         int resId;
@@ -508,7 +572,9 @@ public class SlideEditorActivity extends Activity {
                 break;
 
             case MENU_DURATION:
-                showDurationDialog();
+                new NumberPickerDialog(this, this,
+                        mSlideshowEditor.getDuration(mPosition) / 1000,
+                        1, 120, R.string.duration_selector_title, 0, R.string.secs).show();
                 break;
         }
 
@@ -519,33 +585,9 @@ public class SlideEditorActivity extends Activity {
         mReplaceImage.setText(text);
     }
 
-    private void showDurationDialog() {
-        AlertDialog.Builder builder = new AlertDialog.Builder(this);
-        builder.setIcon(R.drawable.ic_mms_duration);
-        String title = getResources().getString(R.string.duration_selector_title);
-        builder.setTitle(title + (mPosition + 1) + "/" + mSlideshowModel.size());
-
-        builder.setItems(R.array.select_dialog_items,
-                new DialogInterface.OnClickListener() {
-            public void onClick(DialogInterface dialog, int which) {
-                if ((which >= 0) && (which < NUM_DIRECT_DURATIONS)) {
-                    mSlideshowEditor.changeDuration(
-                            mPosition, (which + 1) * 1000);
-                } else {
-                    Intent intent = new Intent(SlideEditorActivity.this,
-                            EditSlideDurationActivity.class);
-                    intent.putExtra(EditSlideDurationActivity.SLIDE_INDEX, mPosition);
-                    intent.putExtra(EditSlideDurationActivity.SLIDE_TOTAL,
-                            mSlideshowModel.size());
-                    intent.putExtra(EditSlideDurationActivity.SLIDE_DUR,
-                            mSlideshowModel.get(mPosition).getDuration() / 1000); // in seconds
-                    startActivityForResult(intent, REQUEST_CODE_CHANGE_DURATION);
-                }
-                dialog.dismiss();
-            }
-        });
-
-        builder.show();
+    @Override
+    public void onNumberSet(int number) {
+        mSlideshowEditor.changeDuration(mPosition, number * 1000);
     }
 
     private void showLayoutSelectorDialog() {
@@ -652,6 +694,9 @@ public class SlideEditorActivity extends Activity {
                 Uri uri;
                 if (requestCode == REQUEST_CODE_CHANGE_MUSIC) {
                     uri = (Uri) data.getParcelableExtra(RingtoneManager.EXTRA_RINGTONE_PICKED_URI);
+                    if (uri == null) {
+                        uri = data.getData();
+                    }
                     if (Settings.System.DEFAULT_RINGTONE_URI.equals(uri)) {
                         return;
                     }
@@ -717,13 +762,13 @@ public class SlideEditorActivity extends Activity {
                     MessageUtils.showErrorDialog(SlideEditorActivity.this,
                             getResourcesString(R.string.exceed_message_size_limitation),
                             getResourcesString(R.string.failed_to_add_media, getVideoString()));
+                } catch (ContentRestrictionException e) {
+                    MessageUtils.showErrorDialog(SlideEditorActivity.this,
+                            getResourcesString(R.string.illegal_message_or_increase_size),
+                            getResourcesString(R.string.failed_to_add_media, getVideoString()));
                 }
                 break;
 
-            case REQUEST_CODE_CHANGE_DURATION:
-                mSlideshowEditor.changeDuration(mPosition,
-                    Integer.valueOf(data.getAction()) * 1000);
-                break;
         }
     }
 
@@ -802,6 +847,25 @@ public class SlideEditorActivity extends Activity {
             setReplaceButtonText(R.string.replace_image);
         } else {
             setReplaceButtonText(R.string.add_picture);
+        }
+    }
+
+    private int getSizeWithOverHead(int size) {
+        return (size + KILOBYTE -1) / KILOBYTE + 1;
+    }
+
+    private void updateMmsSizeIndicator() {
+        TextView sizeIndicator = (TextView) findViewById(R.id.mms_size_indicator);
+
+        mSlideshowModel.updateTotalMessageSize();
+        int mediaSize = mSlideshowModel.getTotalMessageSize();
+        if (mediaSize == 0){
+            sizeIndicator.setVisibility(View.GONE);
+        } else {
+            sizeIndicator.setVisibility(View.VISIBLE);
+            int currentSize = getSizeWithOverHead(mediaSize + mSlideshowModel.getSubjectSize());
+            sizeIndicator.setText(getString(R.string.mms_size_indicator,
+                    currentSize, MmsConfig.getMaxMessageSize() / KILOBYTE));
         }
     }
 }

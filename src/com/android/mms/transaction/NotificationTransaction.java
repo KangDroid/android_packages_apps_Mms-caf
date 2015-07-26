@@ -26,17 +26,20 @@ import static com.google.android.mms.pdu.PduHeaders.STATUS_RETRIEVED;
 import static com.google.android.mms.pdu.PduHeaders.STATUS_UNRECOGNIZED;
 import android.content.ContentValues;
 import android.content.Context;
+import android.database.Cursor;
 import android.database.sqlite.SqliteWrapper;
 import android.net.Uri;
 import android.provider.Telephony.Mms;
 import android.provider.Telephony.Mms.Inbox;
 import android.provider.Telephony.Threads;
+import android.telephony.SubscriptionManager;
 import android.telephony.TelephonyManager;
 import android.util.Log;
 
 import com.android.mms.LogTag;
 import com.android.mms.MmsApp;
 import com.android.mms.MmsConfig;
+import com.android.mms.ui.MessageUtils;
 import com.android.mms.ui.MessagingPreferenceActivity;
 import com.android.mms.util.DownloadManager;
 import com.android.mms.util.Recycler;
@@ -79,8 +82,8 @@ public class NotificationTransaction extends Transaction implements Runnable {
 
     public NotificationTransaction(
             Context context, int serviceId,
-            TransactionSettings connectionSettings, String uriString) {
-        super(context, serviceId, connectionSettings);
+            TransactionSettings connectionSettings, String uriString, int subId) {
+        super(context, serviceId, connectionSettings, subId);
 
         mUri = Uri.parse(uriString);
 
@@ -104,8 +107,8 @@ public class NotificationTransaction extends Transaction implements Runnable {
      */
     public NotificationTransaction(
             Context context, int serviceId,
-            TransactionSettings connectionSettings, NotificationInd ind) {
-        super(context, serviceId, connectionSettings);
+            TransactionSettings connectionSettings, NotificationInd ind, int subId) {
+        super(context, serviceId, connectionSettings, subId);
 
         try {
             // Save the pdu. If we can start downloading the real pdu immediately, don't allow
@@ -139,9 +142,17 @@ public class NotificationTransaction extends Transaction implements Runnable {
         return autoDownload && !dataSuspended;
     }
 
+    public static boolean isMmsSizeTooLarge(NotificationInd nInd) {
+        int currentMmsSize = (int) nInd.getMessageSize();
+        int maxSize = MmsConfig.getMaxMessageSize();
+        return currentMmsSize > maxSize;
+    }
+
     public void run() {
         DownloadManager downloadManager = DownloadManager.getInstance();
         boolean autoDownload = allowAutoDownload();
+        boolean isMemoryFull = MessageUtils.isMmsMemoryFull();
+        boolean isTooLarge = isMmsSizeTooLarge(mNotificationInd);
         try {
             if (LOCAL_LOGV) {
                 Log.v(TAG, "Notification transaction launched: " + this);
@@ -154,6 +165,12 @@ public class NotificationTransaction extends Transaction implements Runnable {
             // Don't try to download when data is suspended, as it will fail, so defer download
             if (!autoDownload) {
                 downloadManager.markState(mUri, DownloadManager.STATE_UNSTARTED);
+                sendNotifyRespInd(status);
+                return;
+            }
+
+            if (isMemoryFull || isTooLarge) {
+                downloadManager.markState(mUri, DownloadManager.STATE_TRANSIENT_FAILURE);
                 sendNotifyRespInd(status);
                 return;
             }
@@ -188,8 +205,13 @@ public class NotificationTransaction extends Transaction implements Runnable {
                             MessagingPreferenceActivity.getIsGroupMmsEnabled(mContext), null);
 
                     // Use local time instead of PDU time
-                    ContentValues values = new ContentValues(1);
+                    ContentValues values = new ContentValues(4);
                     values.put(Mms.DATE, System.currentTimeMillis() / 1000L);
+                    values.put(Mms.SUBSCRIPTION_ID, mSubId);
+                    values.put(Mms.PHONE_ID, SubscriptionManager.getPhoneId(mSubId));
+
+                    // Update Message Size for Original MMS.
+                    values.put(Mms.MESSAGE_SIZE, mNotificationInd.getMessageSize());
                     SqliteWrapper.update(mContext, mContext.getContentResolver(),
                             uri, values, null, null);
 
@@ -234,7 +256,7 @@ public class NotificationTransaction extends Transaction implements Runnable {
             Log.e(TAG, Log.getStackTraceString(t));
         } finally {
             mTransactionState.setContentUri(mUri);
-            if (!autoDownload) {
+            if (!autoDownload || isMemoryFull || isTooLarge) {
                 // Always mark the transaction successful for deferred
                 // download since any error here doesn't make sense.
                 mTransactionState.setState(SUCCESS);
@@ -260,6 +282,15 @@ public class NotificationTransaction extends Transaction implements Runnable {
         } else {
             sendPdu(new PduComposer(mContext, notifyRespInd).make());
         }
+    }
+
+    @Override
+    public void abort() {
+        Log.d(TAG, "markFailed = " + this);
+        DownloadManager downloadManager = DownloadManager.getInstance();
+
+        downloadManager.markState(mUri, DownloadManager.STATE_SKIP_RETRYING);
+        notifyObservers();
     }
 
     @Override

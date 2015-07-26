@@ -54,8 +54,9 @@ public class ReadRecTransaction extends Transaction implements Runnable{
     public ReadRecTransaction(Context context,
             int transId,
             TransactionSettings connectionSettings,
-            String uri) {
-        super(context, transId, connectionSettings);
+            String uri,
+            int subId) {
+        super(context, transId, connectionSettings, subId);
         mReadReportURI = Uri.parse(uri);
         mId = uri;
 
@@ -110,6 +111,15 @@ public class ReadRecTransaction extends Transaction implements Runnable{
             }
             notifyObservers();
         }
+    }
+
+    @Override
+    public void abort() {
+        Log.d(TAG, "markFailed = " + this);
+        mTransactionState.setState(TransactionState.FAILED);
+        mTransactionState.setContentUri(mReadReportURI);
+
+        notifyObservers();
     }
 
     @Override

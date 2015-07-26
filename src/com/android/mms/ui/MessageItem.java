@@ -21,8 +21,11 @@ import java.util.regex.Pattern;
 
 import android.content.ContentUris;
 import android.content.Context;
+import android.content.SharedPreferences;
 import android.database.Cursor;
+import android.drm.DrmStore;
 import android.net.Uri;
+import android.preference.PreferenceManager;
 import android.provider.Telephony.Mms;
 import android.provider.Telephony.MmsSms;
 import android.provider.Telephony.Sms;
@@ -34,6 +37,8 @@ import com.android.mms.MmsApp;
 import com.android.mms.R;
 import com.android.mms.data.Contact;
 import com.android.mms.data.WorkingMessage;
+import com.android.mms.drm.DrmUtils;
+import com.android.mms.model.LayoutModel;
 import com.android.mms.model.SlideModel;
 import com.android.mms.model.SlideshowModel;
 import com.android.mms.model.TextModel;
@@ -43,11 +48,14 @@ import com.android.mms.util.DownloadManager;
 import com.android.mms.util.ItemLoadedCallback;
 import com.android.mms.util.ItemLoadedFuture;
 import com.android.mms.util.PduLoaderManager;
+import com.google.android.mms.ContentType;
 import com.google.android.mms.MmsException;
 import com.google.android.mms.pdu.EncodedStringValue;
 import com.google.android.mms.pdu.MultimediaMessagePdu;
 import com.google.android.mms.pdu.NotificationInd;
+import com.google.android.mms.pdu.PduBody;
 import com.google.android.mms.pdu.PduHeaders;
+import com.google.android.mms.pdu.PduPart;
 import com.google.android.mms.pdu.PduPersister;
 import com.google.android.mms.pdu.RetrieveConf;
 import com.google.android.mms.pdu.SendReq;
@@ -65,6 +73,8 @@ public class MessageItem {
 
     public static int ATTACHMENT_TYPE_NOT_LOADED = -1;
 
+    private final static int CDMA_STATUS_SHIFT = 16;
+
     final Context mContext;
     final String mType;
     final long mMsgId;
@@ -78,6 +88,7 @@ public class MessageItem {
     String mAddress;
     String mContact;
     String mBody; // Body of SMS, first text of MMS.
+    int mSubId;
     String mTextContentType; // ContentType of text of MMS.
     Pattern mHighlight; // portion of message to highlight (from search)
 
@@ -107,6 +118,24 @@ public class MessageItem {
     ColumnsMap mColumnsMap;
     private PduLoadedCallback mPduLoadedCallback;
     private ItemLoadedFuture mItemLoadedFuture;
+    int mLayoutType = LayoutModel.DEFAULT_LAYOUT_TYPE;
+    long mDate;
+    boolean mIsForwardable = true;
+    boolean mHasAttachmentToSave = false;
+    boolean mIsDrmRingtoneWithRights = false;
+
+    boolean mFullTimestamp;
+    boolean mSentTimestamp;
+
+    int mCountDown = 0;
+
+    public int getCountDown() {
+        return mCountDown;
+    }
+
+    public void setCountDown(int countDown) {
+        this.mCountDown = countDown;
+    }
 
     MessageItem(Context context, String type, final Cursor cursor,
             final ColumnsMap columnsMap, Pattern highlight) throws MmsException {
@@ -117,10 +146,18 @@ public class MessageItem {
         mCursor = cursor;
         mColumnsMap = columnsMap;
 
+        SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(mContext);
+        mFullTimestamp = prefs.getBoolean(MessagingPreferenceActivity.FULL_TIMESTAMP, false);
+        mSentTimestamp = prefs.getBoolean(MessagingPreferenceActivity.SENT_TIMESTAMP, false);
+
         if ("sms".equals(type)) {
             mReadReport = false; // No read reports in sms
 
             long status = cursor.getLong(columnsMap.mColumnSmsStatus);
+            // If the 31-16 bits is not 0, means this is a CDMA sms.
+            if ((status >> CDMA_STATUS_SHIFT) > 0) {
+                status = status >> CDMA_STATUS_SHIFT;
+            }
             if (status == Sms.STATUS_NONE) {
                 // No delivery report requested
                 mDeliveryStatus = DeliveryStatus.NONE;
@@ -150,11 +187,20 @@ public class MessageItem {
             }
             mBody = cursor.getString(columnsMap.mColumnSmsBody);
 
+            mSubId = cursor.getInt(columnsMap.mColumnSmsSubId);
             // Unless the message is currently in the progress of being sent, it gets a time stamp.
             if (!isOutgoingMessage()) {
                 // Set "received" or "sent" time stamp
-                long date = cursor.getLong(columnsMap.mColumnSmsDate);
-                mTimestamp = MessageUtils.formatTimeStampString(context, date);
+                if (mSentTimestamp && mBoxId == Sms.MESSAGE_TYPE_INBOX) {
+                    mDate = cursor.getLong(columnsMap.mColumnSmsDateSent);
+                } else {
+                    mDate = cursor.getLong(columnsMap.mColumnSmsDate);
+                }
+                // CDMA SMS stored in UIM card don't have timestamps
+                if (0 == mDate) {
+                    mDate = System.currentTimeMillis();
+                }
+                mTimestamp = MessageUtils.formatTimeStampString(context, mDate, mFullTimestamp);
             }
 
             mLocked = cursor.getInt(columnsMap.mColumnSmsLocked) != 0;
@@ -165,6 +211,8 @@ public class MessageItem {
             mMessageType = cursor.getInt(columnsMap.mColumnMmsMessageType);
             mErrorType = cursor.getInt(columnsMap.mColumnMmsErrorType);
             String subject = cursor.getString(columnsMap.mColumnMmsSubject);
+            mSubId = cursor.getInt(columnsMap.mColumnMmsSubId);
+
             if (!TextUtils.isEmpty(subject)) {
                 EncodedStringValue v = new EncodedStringValue(
                         cursor.getInt(columnsMap.mColumnMmsSubjectCharset),
@@ -250,7 +298,9 @@ public class MessageItem {
 
     public boolean isFailedMessage() {
         boolean isFailedMms = isMms()
-                            && (mErrorType >= MmsSms.ERR_TYPE_GENERIC_PERMANENT);
+                            && (mErrorType >= MmsSms.ERR_TYPE_GENERIC_PERMANENT
+                            || (mErrorType == MmsSms.ERR_TYPE_MMS_PROTO_TRANSIENT
+                && mContext.getResources().getBoolean(R.bool.config_manual_resend)));
         boolean isFailedSms = isSms()
                             && (mBoxId == Sms.MESSAGE_TYPE_FAILED);
         return isFailedMms || isFailedSms;
@@ -283,8 +333,12 @@ public class MessageItem {
         return mMsgId;
     }
 
+    public boolean hasAttachemntToSave(){
+        return mHasAttachmentToSave;
+    }
+
     public int getMmsDownloadStatus() {
-        return mMmsStatus & ~DownloadManager.DEFERRED_MASK;
+        return MessageUtils.getMmsDownloadStatus(mMmsStatus);
     }
 
     @Override
@@ -296,6 +350,52 @@ public class MessageItem {
             " contact: " + mContact +
             " read: " + mReadReport +
             " delivery status: " + mDeliveryStatus;
+    }
+
+    private boolean isContentTypeWorthToSave(String type) {
+        return ContentType.isImageType(type) || ContentType.isVideoType(type)
+                || ContentType.isAudioType(type) || DrmUtils.isDrmType(type)
+                || type.equals(ContentType.AUDIO_OGG.toLowerCase())
+                || type.equals(ContentType.TEXT_VCARD.toLowerCase())
+                || type.equals(ContentType.TEXT_VCALENDAR.toLowerCase());
+    }
+
+    private void isAttachmentSaveable(PduBody body) {
+        for (int i = 0; i < body.getPartsNum(); i++) {
+            PduPart part = body.getPart(i);
+            String type = (new String(part.getContentType())).toLowerCase();
+            if (isContentTypeWorthToSave(type)) {
+                mHasAttachmentToSave = true;
+            }
+        }
+    }
+
+    private void isDrmRingtoneWithRights(PduBody body) {
+        for (int i = 0; i < body.getPartsNum(); i++) {
+            PduPart part = body.getPart(i);
+            String type = (new String(part.getContentType())).toLowerCase();
+            if (DrmUtils.isDrmType(type)) {
+                String mimeType = MmsApp.getApplication().getDrmManagerClient()
+                        .getOriginalMimeType(part.getDataUri());
+                if (ContentType.isAudioType(mimeType)
+                        && DrmUtils.haveRightsForAction(part.getDataUri(),
+                                DrmStore.Action.RINGTONE)) {
+                    mIsDrmRingtoneWithRights = true;
+                }
+            }
+        }
+    }
+
+    private void isForwardable(PduBody body) {
+        for (int i = 0; i < body.getPartsNum(); i++) {
+            PduPart part = body.getPart(i);
+            String type = (new String(part.getContentType())).toLowerCase();
+            if (DrmUtils.isDrmType(type)
+                    && (!DrmUtils.haveRightsForAction(part.getDataUri(),
+                            DrmStore.Action.TRANSFER))) {
+                mIsForwardable = false;
+            }
+        }
     }
 
     public class PduLoadedMessageItemCallback implements ItemLoadedCallback {
@@ -326,6 +426,9 @@ public class MessageItem {
                 MultimediaMessagePdu msg = (MultimediaMessagePdu)pduLoaded.mPdu;
                 mSlideshow = pduLoaded.mSlideshow;
                 mAttachmentType = MessageUtils.getAttachmentType(mSlideshow, msg);
+                if (mSlideshow != null && mSlideshow.getLayout() != null) {
+                    mLayoutType = mSlideshow.getLayout().getLayoutType();
+                }
 
                 if (mMessageType == PduHeaders.MESSAGE_TYPE_RETRIEVE_CONF) {
                     if (msg == null) {
@@ -360,7 +463,7 @@ public class MessageItem {
                     try {
                         reportInt = Integer.parseInt(report);
                         if (reportInt == PduHeaders.VALUE_YES) {
-                            mDeliveryStatus = DeliveryStatus.RECEIVED;
+                            mDeliveryStatus = checkDeliveryStatus();
                         } else {
                             mDeliveryStatus = DeliveryStatus.NONE;
                         }
@@ -384,13 +487,20 @@ public class MessageItem {
                         mReadReport = false;
                     }
                 }
+                PduBody body = msg.getBody();
+                if (body != null) {
+                    isAttachmentSaveable(body);
+                    isDrmRingtoneWithRights(body);
+                    isForwardable(body);
+                }
             }
             if (!isOutgoingMessage()) {
+                String formattedTimestamp = MessageUtils.formatTimeStampString(mContext,
+                        timestamp, mFullTimestamp);
                 if (PduHeaders.MESSAGE_TYPE_NOTIFICATION_IND == mMessageType) {
-                    mTimestamp = mContext.getString(R.string.expire_on,
-                            MessageUtils.formatTimeStampString(mContext, timestamp));
+                    mTimestamp = mContext.getString(R.string.expire_on, formattedTimestamp);
                 } else {
-                    mTimestamp =  MessageUtils.formatTimeStampString(mContext, timestamp);
+                    mTimestamp = formattedTimestamp;
                 }
             }
             if (mPduLoadedCallback != null) {
@@ -398,6 +508,40 @@ public class MessageItem {
             }
         }
     }
+
+    private DeliveryStatus checkDeliveryStatus() {
+        String[] project = {Mms.MESSAGE_ID};
+        Cursor c = mContext.getContentResolver().query(mMessageUri, project, null, null, null);
+        try{
+            if (c != null && c.moveToFirst()) {
+                String m_id = c.getString(0);
+                if (m_id != null) {
+                    String where = Mms.MESSAGE_ID + "=? and " + Mms.MESSAGE_TYPE + "=?";
+                    String[] whereValue = {m_id,
+                            Integer.toString(PduHeaders.MESSAGE_TYPE_DELIVERY_IND)};
+                    Cursor cur = mContext.getContentResolver().query(
+                            Mms.CONTENT_URI, project, where, whereValue, null);
+                    try{
+                        if (cur != null && cur.getCount() > 0) {
+                            return DeliveryStatus.RECEIVED;
+                        } else {
+                            return DeliveryStatus.PENDING;
+                        }
+                    } finally {
+                        if (cur != null) {
+                            cur.close();
+                        }
+                    }
+                }
+            }
+        } finally {
+            if (c != null) {
+                c.close();
+            }
+        }
+        return DeliveryStatus.PENDING;
+    }
+
 
     public void setOnPduLoaded(PduLoadedCallback pduLoadedCallback) {
         mPduLoadedCallback = pduLoadedCallback;

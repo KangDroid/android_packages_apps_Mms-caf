@@ -19,6 +19,7 @@ package com.android.mms.transaction;
 
 import android.os.Bundle;
 
+import com.android.internal.telephony.PhoneConstants;
 import com.android.internal.telephony.uicc.IccUtils;
 
 /**

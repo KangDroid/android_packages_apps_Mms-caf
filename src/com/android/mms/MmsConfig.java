@@ -24,6 +24,7 @@ import org.xmlpull.v1.XmlPullParserException;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.res.Resources;
 import android.content.res.XmlResourceParser;
 import android.preference.PreferenceManager;
 import android.provider.Telephony;
@@ -68,7 +69,7 @@ public class MmsConfig {
     private static int mDefaultSMSMessagesPerThread = 10000;    // default value
     private static int mDefaultMMSMessagesPerThread = 1000;     // default value
     private static int mMinMessageCountPerThread = 2;           // default value
-    private static int mMaxMessageCountPerThread = 5000;        // default value
+    private static int mMaxMessageCountPerThread = 10000;       // default value
     private static int mHttpSocketTimeout = 60*1000;            // default to 1 min
     private static int mMinimumSlideElementDuration = 7;        // default to 7 sec
     private static boolean mNotifyWapMMSC = false;
@@ -112,6 +113,10 @@ public class MmsConfig {
     // activity.
     private static boolean mEnableGroupMms = true;
 
+    private static int MAX_SLIDE_NUM = 10;
+
+    private static float sMmsCornerRadius = 5;
+
     public static void init(Context context) {
         if (LOCAL_LOGV) {
             Log.v(TAG, "MmsConfig.init()");
@@ -121,6 +126,14 @@ public class MmsConfig {
                 android.os.SystemProperties.get(TelephonyProperties.PROPERTY_ICC_OPERATOR_NUMERIC));
 
         loadMmsSettings(context);
+
+        final Resources res = context.getResources();
+        MAX_SLIDE_NUM = res.getInteger(R.integer.max_slide_num);
+        sMmsCornerRadius = res.getDimension(R.dimen.mms_image_corner_radius);
+    }
+
+    public static int getMaxSlideNumber() {
+        return MAX_SLIDE_NUM;
     }
 
     public static boolean isSmsEnabled(Context context) {
@@ -150,7 +163,11 @@ public class MmsConfig {
         return intent;
     }
 
-    public static int getSmsToMmsTextThreshold() {
+    public static int getSmsToMmsTextThreshold(Context context) {
+        int limitCount = context.getResources().getInteger(R.integer.limit_count);
+        if (limitCount != 0) {
+            return limitCount;
+        }
         return mSmsToMmsTextThreshold;
     }
 
@@ -264,6 +281,10 @@ public class MmsConfig {
 
     public static int getMaxSizeScaleForPendingMmsAllowed() {
         return mMaxSizeScaleForPendingMmsAllowed;
+    }
+
+    public static float getMmsCornerRadius() {
+        return sMmsCornerRadius;
     }
 
     public static boolean isAliasEnabled() {
@@ -398,7 +419,10 @@ public class MmsConfig {
                         } else if ("aliasMaxChars".equalsIgnoreCase(value)) {
                             mAliasRuleMaxChars = Integer.parseInt(text);
                         } else if ("smsToMmsTextThreshold".equalsIgnoreCase(value)) {
-                            mSmsToMmsTextThreshold = Integer.parseInt(text);
+                            int maxSmstomms = context.getResources().getInteger(R.integer
+                                    .config_max_smstomms);
+                            mSmsToMmsTextThreshold = (maxSmstomms == 0) ? Integer.parseInt(text)
+                                    : maxSmstomms;
                         } else if ("maxMessageTextSize".equalsIgnoreCase(value)) {
                             mMaxTextLength = Integer.parseInt(text);
                         } else if ("maxSubjectLength".equalsIgnoreCase(value)) {

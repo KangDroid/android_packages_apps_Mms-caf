@@ -22,12 +22,15 @@ import android.net.Uri;
 import android.util.Log;
 
 import com.android.mms.LogTag;
+import com.android.mms.MmsConfig;
 import com.android.mms.model.AudioModel;
 import com.android.mms.model.ImageModel;
 import com.android.mms.model.RegionModel;
 import com.android.mms.model.SlideModel;
 import com.android.mms.model.SlideshowModel;
 import com.android.mms.model.TextModel;
+import com.android.mms.model.VcardModel;
+import com.android.mms.model.VCalModel;
 import com.android.mms.model.VideoModel;
 import com.google.android.mms.ContentType;
 import com.google.android.mms.MmsException;
@@ -37,8 +40,6 @@ import com.google.android.mms.MmsException;
  */
 public class SlideshowEditor {
     private static final String TAG = LogTag.TAG;
-
-    public static final int MAX_SLIDE_NUM = 10;
 
     private final Context mContext;
     private SlideshowModel mModel;
@@ -71,7 +72,7 @@ public class SlideshowEditor {
      */
     public boolean addNewSlide(int position) {
         int size = mModel.size();
-        if (size < MAX_SLIDE_NUM) {
+        if (size < MmsConfig.getMaxSlideNumber()) {
             SlideModel slide = new SlideModel(mModel);
 
             TextModel text = new TextModel(
@@ -128,7 +129,7 @@ public class SlideshowEditor {
      */
     public boolean addSlide(int position, SlideModel slide) {
         int size = mModel.size();
-        if (size < MAX_SLIDE_NUM) {
+        if (size < MmsConfig.getMaxSlideNumber()) {
             mModel.add(position, slide);
             return true;
         } else {
@@ -177,6 +178,14 @@ public class SlideshowEditor {
         return mModel.get(position).removeAudio();
     }
 
+    public boolean removeVcard(int position) {
+        return mModel.get(position).removeVcard();
+    }
+
+    public boolean removeVCal(int position) {
+        return mModel.get(position).removeVCal();
+    }
+
     public void changeText(int position, String newText) {
         if (newText != null) {
             SlideModel slide = mModel.get(position);
@@ -213,6 +222,20 @@ public class SlideshowEditor {
         slide.updateDuration(video.getDuration());
     }
 
+    public void changeVcard(int position, Uri newVcard) throws MmsException {
+        VcardModel vCard = new VcardModel(mContext, newVcard);
+        SlideModel slide = mModel.get(position);
+        slide.add(vCard);
+        slide.updateDuration(vCard.getDuration());
+    }
+
+    public void changeVCal(int position, Uri newIcal) throws MmsException {
+        VCalModel vcal = new VCalModel(mContext, newIcal);
+        SlideModel slide = mModel.get(position);
+        slide.add(vcal);
+        slide.updateDuration(vcal.getDuration());
+    }
+
     public void moveSlideUp(int position) {
         mModel.add(position - 1, mModel.remove(position));
     }
@@ -225,6 +248,10 @@ public class SlideshowEditor {
         if (dur >= 0) {
             mModel.get(position).setDuration(dur);
         }
+    }
+
+    public int getDuration(int position) {
+        return mModel.get(position).getDuration();
     }
 
     public void changeLayout(int layout) {

@@ -25,6 +25,7 @@ import android.net.Uri;
 import android.provider.Telephony.Mms;
 import android.provider.Telephony.Mms.Sent;
 import android.text.TextUtils;
+import android.telephony.SubscriptionManager;
 import android.util.Log;
 
 import com.android.mms.LogTag;
@@ -60,9 +61,9 @@ public class SendTransaction extends Transaction implements Runnable {
     private Thread mThread;
     public final Uri mSendReqURI;
 
-    public SendTransaction(Context context,
-            int transId, TransactionSettings connectionSettings, String uri) {
-        super(context, transId, connectionSettings);
+    public SendTransaction(Context context, int transId,
+            TransactionSettings connectionSettings, String uri, int subId) {
+        super(context, transId, connectionSettings, subId);
         mSendReqURI = Uri.parse(uri);
         mId = uri;
 
@@ -103,7 +104,8 @@ public class SendTransaction extends Transaction implements Runnable {
                                  mSendReqURI, values, null, null);
 
             // fix bug 2100169: insert the 'from' address per spec
-            String lineNumber = MessageUtils.getLocalNumber();
+            String lineNumber = MessageUtils.getLocalNumber(mSubId);
+            Log.d(TAG, "lineNumber " + lineNumber);
             if (!TextUtils.isEmpty(lineNumber)) {
                 sendReq.setFrom(new EncodedStringValue(lineNumber));
             }
@@ -169,6 +171,15 @@ public class SendTransaction extends Transaction implements Runnable {
             }
             notifyObservers();
         }
+    }
+
+    @Override
+    public void abort() {
+        Log.d(TAG, "markFailed = " + this);
+        mTransactionState.setState(TransactionState.FAILED);
+        mTransactionState.setContentUri(mSendReqURI);
+
+        notifyObservers();
     }
 
     @Override

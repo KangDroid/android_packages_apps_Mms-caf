@@ -17,29 +17,45 @@
 
 package com.android.mms.ui;
 
+import java.util.List;
 import java.util.Map;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
+import android.app.Activity;
 import android.app.AlertDialog;
+import android.content.ComponentName;
 import android.content.Context;
+import android.content.ContentResolver;
+import android.content.ContentValues;
 import android.content.DialogInterface;
 import android.content.Intent;
+import android.content.res.Resources;
+import android.database.sqlite.SqliteWrapper;
 import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.graphics.Paint.FontMetricsInt;
 import android.graphics.Typeface;
 import android.graphics.drawable.Drawable;
+import android.graphics.drawable.LayerDrawable;
+import android.graphics.drawable.StateListDrawable;
 import android.net.Uri;
 import android.os.Handler;
 import android.os.Message;
+import android.provider.Browser;
 import android.provider.ContactsContract.Profile;
 import android.provider.Telephony.Sms;
+import android.provider.Telephony.Mms;
+import android.support.v4.graphics.drawable.RoundedBitmapDrawable;
+import android.support.v4.graphics.drawable.RoundedBitmapDrawableFactory;
 import android.telephony.PhoneNumberUtils;
 import android.telephony.TelephonyManager;
 import android.text.Html;
 import android.text.SpannableStringBuilder;
+import android.text.Spanned;
 import android.text.TextUtils;
 import android.text.method.HideReturnsTransformationMethod;
+import android.text.style.AbsoluteSizeSpan;
 import android.text.style.ForegroundColorSpan;
 import android.text.style.LineHeightSpan;
 import android.text.style.StyleSpan;
@@ -47,86 +63,113 @@ import android.text.style.TextAppearanceSpan;
 import android.text.style.URLSpan;
 import android.util.AttributeSet;
 import android.util.Log;
+import android.util.TypedValue;
 import android.view.View;
 import android.view.View.OnClickListener;
 import android.view.ViewGroup;
+import android.view.WindowManager;
 import android.widget.ArrayAdapter;
 import android.widget.Button;
+import android.widget.Checkable;
+import android.widget.EditText;
 import android.widget.ImageButton;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 
+import com.android.contacts.common.widget.CheckableQuickContactBadge;
+import com.android.internal.telephony.PhoneConstants;
 import com.android.mms.LogTag;
 import com.android.mms.MmsApp;
+import com.android.mms.MmsConfig;
 import com.android.mms.R;
 import com.android.mms.data.Contact;
 import com.android.mms.data.WorkingMessage;
+import com.android.mms.model.LayoutModel;
 import com.android.mms.model.SlideModel;
 import com.android.mms.model.SlideshowModel;
+import com.android.mms.transaction.SmsReceiverService;
 import com.android.mms.transaction.Transaction;
 import com.android.mms.transaction.TransactionBundle;
 import com.android.mms.transaction.TransactionService;
+import com.android.mms.ui.WwwContextMenuActivity;
+import com.android.mms.ui.zoom.ZoomMessageListItem;
 import com.android.mms.util.DownloadManager;
 import com.android.mms.util.ItemLoadedCallback;
+import com.android.mms.util.SmileyParser;
 import com.android.mms.util.ThumbnailManager.ImageLoaded;
 import com.google.android.mms.ContentType;
+import com.google.android.mms.MmsException;
+import com.google.android.mms.pdu.NotificationInd;
 import com.google.android.mms.pdu.PduHeaders;
+import com.google.android.mms.pdu.PduPersister;
 
 /**
  * This class provides view of a message in the messages list.
  */
-public class MessageListItem extends LinearLayout implements
-        SlideViewInterface, OnClickListener {
+public class MessageListItem extends ZoomMessageListItem implements
+        SlideViewInterface, OnClickListener, Checkable {
     public static final String EXTRA_URLS = "com.android.mms.ExtraUrls";
 
     private static final String TAG = LogTag.TAG;
     private static final boolean DEBUG = false;
     private static final boolean DEBUG_DONT_LOAD_IMAGES = false;
+    // The message is from Browser
+    private static final String BROWSER_ADDRESS = "Browser Information";
+    private static final String CANCEL_URI = "canceluri";
+    // transparent background
+    private static final int ALPHA_TRANSPARENT = 0;
 
     static final int MSG_LIST_EDIT    = 1;
     static final int MSG_LIST_PLAY    = 2;
     static final int MSG_LIST_DETAILS = 3;
+
+    private boolean mIsCheck = false;
 
     private View mMmsView;
     private ImageView mImageView;
     private ImageView mLockedIndicator;
     private ImageView mDeliveredIndicator;
     private ImageView mDetailsIndicator;
+    private ImageView mSimIndicatorView;
     private ImageButton mSlideShowButton;
+    private TextView mSimMessageAddress;
     private TextView mBodyTextView;
+    private TextView mMessageSizeView;
     private Button mDownloadButton;
-    private TextView mDownloadingLabel;
+    private View mDownloading;
+    private LinearLayout mMmsLayout;
     private Handler mHandler;
     private MessageItem mMessageItem;
     private String mDefaultCountryIso;
     private TextView mDateView;
+    private TextView mSimNameView;
     public View mMessageBlock;
-    private QuickContactDivot mAvatar;
-    static private Drawable sDefaultContactImage;
+    private CheckableQuickContactBadge mAvatar;
+    static private RoundedBitmapDrawable sDefaultContactImage;
     private Presenter mPresenter;
     private int mPosition;      // for debugging
     private ImageLoadedCallback mImageLoadedCallback;
     private boolean mMultiRecipients;
+    private int mManageMode;
 
     public MessageListItem(Context context) {
-        super(context);
-        mDefaultCountryIso = MmsApp.getApplication().getCurrentCountryIso();
-
-        if (sDefaultContactImage == null) {
-            sDefaultContactImage = context.getResources().getDrawable(R.drawable.ic_contact_picture);
-        }
+        this(context, null);
     }
 
     public MessageListItem(Context context, AttributeSet attrs) {
         super(context, attrs);
 
-        int color = mContext.getResources().getColor(R.color.timestamp_color);
-        mColorSpan = new ForegroundColorSpan(color);
+        Resources res = context.getResources();
+        mColorSpan = new ForegroundColorSpan(res.getColor(R.color.timestamp_color));
         mDefaultCountryIso = MmsApp.getApplication().getCurrentCountryIso();
 
         if (sDefaultContactImage == null) {
-            sDefaultContactImage = context.getResources().getDrawable(R.drawable.ic_contact_picture);
+            Bitmap defaultImage = BitmapFactory.decodeResource(res, R.drawable.ic_contact_picture);
+            sDefaultContactImage = RoundedBitmapDrawableFactory.create(res, defaultImage);
+            sDefaultContactImage.setAntiAlias(true);
+            sDefaultContactImage.setCornerRadius(
+                    Math.max(defaultImage.getWidth() / 2, defaultImage.getHeight() / 2));
         }
     }
 
@@ -139,11 +182,26 @@ public class MessageListItem extends LinearLayout implements
         mLockedIndicator = (ImageView) findViewById(R.id.locked_indicator);
         mDeliveredIndicator = (ImageView) findViewById(R.id.delivered_indicator);
         mDetailsIndicator = (ImageView) findViewById(R.id.details_indicator);
-        mAvatar = (QuickContactDivot) findViewById(R.id.avatar);
+        mAvatar = (CheckableQuickContactBadge) findViewById(R.id.avatar);
+        mSimIndicatorView = (ImageView) findViewById(R.id.sim_indicator_icon);
+        mSimNameView = (TextView) findViewById(R.id.sim_name);
         mMessageBlock = findViewById(R.id.message_block);
+        mSimMessageAddress = (TextView) findViewById(R.id.sim_message_address);
+        mMessageSizeView = (TextView) findViewById(R.id.mms_msg_size_view);
+        mMmsLayout = (LinearLayout) findViewById(R.id.mms_layout_view_parent);
+
+        mAvatar.setOverlay(null);
+
+        // Add the views to be managed by the zoom control
+        addZoomableTextView(mBodyTextView);
+        addZoomableTextView(mDateView);
+        addZoomableTextView(mSimMessageAddress);
+        addZoomableTextView(mSimNameView);
+        addZoomableTextView(mMessageSizeView);
     }
 
-    public void bind(MessageItem msgItem, boolean convHasMultiRecipients, int position) {
+    public void bind(MessageItem msgItem, int accentColor,
+            boolean convHasMultiRecipients, int position, boolean selected) {
         if (DEBUG) {
             Log.v(TAG, "bind for item: " + position + " old: " +
                    (mMessageItem != null ? mMessageItem.toString() : "NULL" ) +
@@ -151,7 +209,6 @@ public class MessageListItem extends LinearLayout implements
         }
         boolean sameItem = mMessageItem != null && mMessageItem.mMsgId == msgItem.mMsgId;
         mMessageItem = msgItem;
-
         mPosition = position;
         mMultiRecipients = convHasMultiRecipients;
 
@@ -168,6 +225,25 @@ public class MessageListItem extends LinearLayout implements
             default:
                 bindCommonMessage(sameItem);
                 break;
+        }
+
+        tintBackground(mMessageBlock.getBackground(), accentColor);
+        mMessageBlock.setSelected(selected);
+        mAvatar.setChecked(selected, sameItem);
+        customSIMSmsView();
+    }
+
+    private void tintBackground(Drawable background, int color) {
+        if (background instanceof LayerDrawable) {
+            Drawable base = ((LayerDrawable) background).findDrawableByLayerId(R.id.base_layer);
+            if (base instanceof StateListDrawable) {
+                StateListDrawable sld = (StateListDrawable) base;
+                base = sld.getStateDrawable(sld.getStateDrawableIndex(null));
+
+            }
+            if (base != null) {
+                base.setTint(color);
+            }
         }
     }
 
@@ -200,16 +276,21 @@ public class MessageListItem extends LinearLayout implements
     private void bindNotifInd() {
         showMmsView(false);
 
-        String msgSizeText = mContext.getString(R.string.message_size_label)
-                                + String.valueOf((mMessageItem.mMessageSize + 1023) / 1024)
-                                + mContext.getString(R.string.kilobyte);
-
         mBodyTextView.setText(formatMessage(mMessageItem, null,
                                             mMessageItem.mSubject,
                                             mMessageItem.mHighlight,
                                             mMessageItem.mTextContentType));
 
-        mDateView.setText(buildTimestampLine(msgSizeText + " " + mMessageItem.mTimestamp));
+        mDateView.setText(buildTimestampLine(mMessageItem.mTimestamp));
+
+        final String msgSizeText = mContext.getString(R.string.message_size_label)
+                + String.valueOf((mMessageItem.mMessageSize + 1023) / 1024)
+                + mContext.getString(R.string.kilobyte);
+
+        mMessageSizeView.setText(msgSizeText);
+        mMessageSizeView.setVisibility(View.VISIBLE);
+
+        updateSimIndicatorView(mMessageItem.mSubId);
 
         switch (mMessageItem.getMmsDownloadStatus()) {
             case DownloadManager.STATE_PRE_DOWNLOADING:
@@ -232,25 +313,60 @@ public class MessageListItem extends LinearLayout implements
                 }
             case DownloadManager.STATE_TRANSIENT_FAILURE:
             case DownloadManager.STATE_PERMANENT_FAILURE:
-            case DownloadManager.STATE_SKIP_RETRYING:
             default:
                 setLongClickable(true);
                 inflateDownloadControls();
-                mDownloadingLabel.setVisibility(View.GONE);
+                mDownloading.setVisibility(View.GONE);
                 mDownloadButton.setVisibility(View.VISIBLE);
                 mDownloadButton.setOnClickListener(new OnClickListener() {
                     @Override
                     public void onClick(View v) {
-                        mDownloadingLabel.setVisibility(View.VISIBLE);
+                        mDownloading.setVisibility(View.VISIBLE);
+                        try {
+                            NotificationInd nInd = (NotificationInd) PduPersister.getPduPersister(
+                                    mContext).load(mMessageItem.mMessageUri);
+                            Log.d(TAG, "Download notify Uri = " + mMessageItem.mMessageUri);
+                            AlertDialog.Builder builder = new AlertDialog.Builder(mContext);
+                            builder.setTitle(R.string.download);
+                            builder.setCancelable(true);
+                            // Judge notification weather is expired
+                            if (nInd.getExpiry() < System.currentTimeMillis() / 1000L) {
+                                // builder.setIcon(R.drawable.ic_dialog_alert_holo_light);
+                                builder.setMessage(mContext
+                                        .getString(R.string.service_message_not_found));
+                                builder.show();
+                                SqliteWrapper.delete(mContext, mContext.getContentResolver(),
+                                        mMessageItem.mMessageUri, null, null);
+                                return;
+                            }
+                            // Judge whether memory is full
+                            else if (MessageUtils.isMmsMemoryFull()) {
+                                builder.setMessage(mContext.getString(R.string.sms_full_body));
+                                builder.show();
+                                return;
+                            }
+                            // Judge whether message size is too large
+                            else if ((int) nInd.getMessageSize() >
+                                      MmsConfig.getMaxMessageSize()) {
+                                builder.setMessage(mContext.getString(R.string.mms_too_large));
+                                builder.show();
+                                return;
+                            }
+                        } catch (MmsException e) {
+                            Log.e(TAG, e.getMessage(), e);
+                            return;
+                        }
                         mDownloadButton.setVisibility(View.GONE);
                         Intent intent = new Intent(mContext, TransactionService.class);
                         intent.putExtra(TransactionBundle.URI, mMessageItem.mMessageUri.toString());
                         intent.putExtra(TransactionBundle.TRANSACTION_TYPE,
                                 Transaction.RETRIEVE_TRANSACTION);
+                        intent.putExtra(PhoneConstants.SUBSCRIPTION_KEY, mMessageItem.mSubId);
+
                         mContext.startService(intent);
 
                         DownloadManager.getInstance().markState(
-                                    mMessageItem.mMessageUri, DownloadManager.STATE_PRE_DOWNLOADING);
+                                 mMessageItem.mMessageUri, DownloadManager.STATE_PRE_DOWNLOADING);
                     }
                 });
                 break;
@@ -261,6 +377,22 @@ public class MessageListItem extends LinearLayout implements
         mDeliveredIndicator.setVisibility(View.GONE);
         mDetailsIndicator.setVisibility(View.GONE);
         updateAvatarView(mMessageItem.mAddress, false);
+    }
+
+    private void updateSimIndicatorView(int subId) {
+        if (MessageUtils.isMsimIccCardActive() && subId >= 0) {
+            Drawable mSimIndicatorIcon = MessageUtils.getMultiSimIcon(mContext, subId);
+            mSimIndicatorView.setImageDrawable(mSimIndicatorIcon);
+            mSimIndicatorView.setVisibility(View.VISIBLE);
+
+            CharSequence simName = MessageUtils.getSimName(mContext, subId);
+            if (simName != null) {
+                mSimNameView.setText(simName);
+                mSimNameView.setVisibility(View.VISIBLE);
+            } else {
+                mSimNameView.setVisibility(View.GONE);
+            }
+        }
     }
 
     private String buildTimestampLine(String timestamp) {
@@ -275,36 +407,43 @@ public class MessageListItem extends LinearLayout implements
 
     private void showDownloadingAttachment() {
         inflateDownloadControls();
-        mDownloadingLabel.setVisibility(View.VISIBLE);
+        mDownloading.setVisibility(View.VISIBLE);
         mDownloadButton.setVisibility(View.GONE);
     }
 
     private void updateAvatarView(String addr, boolean isSelf) {
         Drawable avatarDrawable;
         if (isSelf || !TextUtils.isEmpty(addr)) {
-            Contact contact = isSelf ? Contact.getMe(false) : Contact.get(addr, false);
-            avatarDrawable = contact.getAvatar(mContext, sDefaultContactImage);
+            Contact contact = isSelf ? Contact.getMe(false) : Contact.get(addr, true);
+            contact.bindAvatar(mAvatar);
 
             if (isSelf) {
                 mAvatar.assignContactUri(Profile.CONTENT_URI);
             } else {
                 if (contact.existsInDatabase()) {
                     mAvatar.assignContactUri(contact.getUri());
+                } else if (MessageUtils.isWapPushNumber(contact.getNumber())) {
+                    mAvatar.assignContactFromPhone(
+                            MessageUtils.getWapPushNumber(contact.getNumber()), true);
                 } else {
                     mAvatar.assignContactFromPhone(contact.getNumber(), true);
                 }
             }
         } else {
-            avatarDrawable = sDefaultContactImage;
+            mAvatar.setImageDrawable(sDefaultContactImage);
         }
-        mAvatar.setImageDrawable(avatarDrawable);
+    }
+
+    public TextView getBodyTextView() {
+        return mBodyTextView;
     }
 
     private void bindCommonMessage(final boolean sameItem) {
         if (mDownloadButton != null) {
             mDownloadButton.setVisibility(View.GONE);
-            mDownloadingLabel.setVisibility(View.GONE);
+            mDownloading.setVisibility(View.GONE);
         }
+
         // Since the message text should be concatenated with the sender's
         // address(or name), I have to display it here instead of
         // displaying it by the Presenter.
@@ -325,6 +464,19 @@ public class MessageListItem extends LinearLayout implements
             updateAvatarView(addr, isSelf);
         }
 
+        // Add SIM sms address above body.
+        if (isSimCardMessage()) {
+            mSimMessageAddress.setVisibility(VISIBLE);
+            SpannableStringBuilder buf = new SpannableStringBuilder();
+            if (mMessageItem.mBoxId == Sms.MESSAGE_TYPE_INBOX) {
+                buf.append(mContext.getString(R.string.from_label));
+            } else {
+                buf.append(mContext.getString(R.string.to_address_label));
+            }
+            buf.append(Contact.get(mMessageItem.mAddress, true).getName());
+            mSimMessageAddress.setText(buf);
+        }
+
         // Get and/or lazily set the formatted message from/on the
         // MessageItem.  Because the MessageItem instances come from a
         // cache (currently of size ~50), the hit rate on avoiding the
@@ -341,14 +493,14 @@ public class MessageListItem extends LinearLayout implements
         if (!sameItem || haveLoadedPdu) {
             mBodyTextView.setText(formattedMessage);
         }
-
+        updateSimIndicatorView(mMessageItem.mSubId);
         // Debugging code to put the URI of the image attachment in the body of the list item.
         if (DEBUG) {
             String debugText = null;
             if (mMessageItem.mSlideshow == null) {
                 debugText = "NULL slideshow";
             } else {
-                SlideModel slide = mMessageItem.mSlideshow.get(0);
+                SlideModel slide = ((SlideshowModel) mMessageItem.mSlideshow).get(0);
                 if (slide == null) {
                     debugText = "NULL first slide";
                 } else if (!slide.hasImage()) {
@@ -363,8 +515,12 @@ public class MessageListItem extends LinearLayout implements
         // If we're in the process of sending a message (i.e. pending), then we show a "SENDING..."
         // string in place of the timestamp.
         if (!sameItem || haveLoadedPdu) {
+            boolean isCountingDown = mMessageItem.getCountDown() > 0 &&
+                MessagingPreferenceActivity.getMessageSendDelayDuration(mContext) > 0;
+            int sendingTextResId = isCountingDown
+                    ? R.string.sent_countdown : R.string.sending_message;
             mDateView.setText(buildTimestampLine(mMessageItem.isSending() ?
-                    mContext.getResources().getString(R.string.sending_message) :
+                    mContext.getResources().getString(sendingTextResId) :
                         mMessageItem.mTimestamp));
         }
         if (mMessageItem.isSms()) {
@@ -387,6 +543,7 @@ public class MessageListItem extends LinearLayout implements
                 showMmsView(false);
             }
             if (mMessageItem.mSlideshow == null) {
+                final int mCurrentAttachmentType = mMessageItem.mAttachmentType;
                 mMessageItem.setOnPduLoaded(new MessageItem.PduLoadedCallback() {
                     public void onPduLoaded(MessageItem messageItem) {
                         if (DEBUG) {
@@ -398,7 +555,8 @@ public class MessageListItem extends LinearLayout implements
                         if (messageItem != null && mMessageItem != null &&
                                 messageItem.getMessageId() == mMessageItem.getMessageId()) {
                             mMessageItem.setCachedFormattedMessage(null);
-                            bindCommonMessage(true);
+                            bindCommonMessage(
+                                    mCurrentAttachmentType == messageItem.mAttachmentType);
                         }
                     }
                 });
@@ -420,7 +578,6 @@ public class MessageListItem extends LinearLayout implements
             }
         }
         drawRightStatusIndicator(mMessageItem);
-
         requestLayout();
     }
 
@@ -454,6 +611,19 @@ public class MessageListItem extends LinearLayout implements
         }
     }
 
+    DialogInterface.OnClickListener mCancelLinstener = new DialogInterface.OnClickListener() {
+        @Override
+        public void onClick(DialogInterface dialog, final int whichButton) {
+            if (mDownloading.getVisibility() == View.VISIBLE) {
+                Intent intent = new Intent(mContext, TransactionService.class);
+                intent.putExtra(CANCEL_URI, mMessageItem.mMessageUri.toString());
+                mContext.startService(intent);
+                DownloadManager.getInstance().markState(mMessageItem.mMessageUri,
+                        DownloadManager.STATE_TRANSIENT_FAILURE);
+            }
+        }
+    };
+
     @Override
     public void startAudio() {
         // TODO Auto-generated method stub
@@ -474,7 +644,10 @@ public class MessageListItem extends LinearLayout implements
         showMmsView(true);
 
         try {
-            mImageView.setImageBitmap(bitmap);
+            RoundedBitmapDrawable drawable =
+                    RoundedBitmapDrawableFactory.create(getResources(), bitmap);
+            drawable.setCornerRadius(MmsConfig.getMmsCornerRadius());
+            mImageView.setImageDrawable(drawable);
             mImageView.setVisibility(VISIBLE);
         } catch (java.lang.OutOfMemoryError e) {
             Log.e(TAG, "setImage: out of memory: ", e);
@@ -510,7 +683,24 @@ public class MessageListItem extends LinearLayout implements
             //inflate the download controls
             findViewById(R.id.mms_downloading_view_stub).setVisibility(VISIBLE);
             mDownloadButton = (Button) findViewById(R.id.btn_download_msg);
-            mDownloadingLabel = (TextView) findViewById(R.id.label_downloading);
+            if (getResources().getBoolean(R.bool.config_mms_cancelable)) {
+                mDownloading = (Button) findViewById(R.id.btn_cancel_download);
+                mDownloading.setOnClickListener(new OnClickListener() {
+                    @Override
+                    public void onClick(View v) {
+                        AlertDialog.Builder builder = new AlertDialog.Builder(mContext);
+                        builder.setTitle(R.string.cancel_downloading)
+                                .setIconAttribute(android.R.attr.alertDialogIcon)
+                                .setCancelable(true)
+                                .setPositiveButton(R.string.yes, mCancelLinstener)
+                                .setNegativeButton(R.string.no, null)
+                                .setMessage(R.string.confirm_cancel_downloading)
+                                .show();
+                    }
+                });
+            } else {
+                mDownloading = (TextView) findViewById(R.id.label_downloading);
+            }
         }
     }
 
@@ -534,8 +724,14 @@ public class MessageListItem extends LinearLayout implements
         SpannableStringBuilder buf = new SpannableStringBuilder();
 
         boolean hasSubject = !TextUtils.isEmpty(subject);
+        SmileyParser parser = SmileyParser.getInstance();
         if (hasSubject) {
-            buf.append(mContext.getResources().getString(R.string.inline_subject, subject));
+            CharSequence smilizedSubject = parser.addSmileySpans(subject);
+            // Can't use the normal getString() with extra arguments for string replacement
+            // because it doesn't preserve the SpannableText returned by addSmileySpans.
+            // We have to manually replace the %s with our text.
+            buf.append(TextUtils.replace(mContext.getResources().getString(R.string.inline_subject),
+                    new String[] { "%s" }, new CharSequence[] { smilizedSubject }));
         }
 
         if (!TextUtils.isEmpty(body)) {
@@ -547,7 +743,7 @@ public class MessageListItem extends LinearLayout implements
                 if (hasSubject) {
                     buf.append(" - ");
                 }
-                buf.append(body);
+                buf.append(parser.addSmileySpans(body));
             }
         }
 
@@ -560,6 +756,14 @@ public class MessageListItem extends LinearLayout implements
         return buf;
     }
 
+    private boolean isSimCardMessage() {
+        return mContext instanceof ManageSimMessages;
+    }
+
+    public void setManageSelectMode(int manageMode) {
+        mManageMode = manageMode;
+    }
+
     private void drawPlaybackButton(MessageItem msgItem) {
         switch (msgItem.mAttachmentType) {
             case WorkingMessage.SLIDESHOW:
@@ -570,19 +774,7 @@ public class MessageListItem extends LinearLayout implements
                 // Set call-back for the 'Play' button.
                 mSlideShowButton.setOnClickListener(this);
                 mSlideShowButton.setVisibility(View.VISIBLE);
-                setLongClickable(true);
-
-                // When we show the mSlideShowButton, this list item's onItemClickListener doesn't
-                // get called. (It gets set in ComposeMessageActivity:
-                // mMsgListView.setOnItemClickListener) Here we explicitly set the item's
-                // onClickListener. It allows the item to respond to embedded html links and at the
-                // same time, allows the slide show play button to work.
-                setOnClickListener(new OnClickListener() {
-                    @Override
-                    public void onClick(View v) {
-                        onMessageListItemClick();
-                    }
-                });
+                setLongClickable(false);
                 break;
             default:
                 mSlideShowButton.setVisibility(View.GONE);
@@ -605,6 +797,10 @@ public class MessageListItem extends LinearLayout implements
     }
 
     public void onMessageListItemClick() {
+        if (mMessageItem != null && mMessageItem.isSending() && mMessageItem.isSms()) {
+            SmsReceiverService.cancelSendingMessage(mMessageItem.mMessageUri);
+            return;
+        }
         // If the message is a failed one, clicking it should reload it in the compose view,
         // regardless of whether it has links in it
         if (mMessageItem != null &&
@@ -619,77 +815,17 @@ public class MessageListItem extends LinearLayout implements
 
         // Check for links. If none, do nothing; if 1, open it; if >1, ask user to pick one
         final URLSpan[] spans = mBodyTextView.getUrls();
-
         if (spans.length == 0) {
-            sendMessage(mMessageItem, MSG_LIST_DETAILS);    // show the message details dialog
-        } else if (spans.length == 1) {
-            spans[0].onClick(mBodyTextView);
+            sendMessage(mMessageItem, MSG_LIST_DETAILS);
         } else {
-            ArrayAdapter<URLSpan> adapter =
-                new ArrayAdapter<URLSpan>(mContext, android.R.layout.select_dialog_item, spans) {
-                @Override
-                public View getView(int position, View convertView, ViewGroup parent) {
-                    View v = super.getView(position, convertView, parent);
-                    try {
-                        URLSpan span = getItem(position);
-                        String url = span.getURL();
-                        Uri uri = Uri.parse(url);
-                        TextView tv = (TextView) v;
-                        Drawable d = mContext.getPackageManager().getActivityIcon(
-                                new Intent(Intent.ACTION_VIEW, uri));
-                        if (d != null) {
-                            d.setBounds(0, 0, d.getIntrinsicHeight(), d.getIntrinsicHeight());
-                            tv.setCompoundDrawablePadding(10);
-                            tv.setCompoundDrawables(d, null, null, null);
-                        }
-                        final String telPrefix = "tel:";
-                        if (url.startsWith(telPrefix)) {
-                            if ((mDefaultCountryIso == null) || mDefaultCountryIso.isEmpty()) {
-                                url = url.substring(telPrefix.length());
-                            }
-                            else {
-                                url = PhoneNumberUtils.formatNumber(
-                                        url.substring(telPrefix.length()), mDefaultCountryIso);
-                            }
-                        }
-                        tv.setText(url);
-                    } catch (android.content.pm.PackageManager.NameNotFoundException ex) {
-                        // it's ok if we're unable to set the drawable for this view - the user
-                        // can still use it
-                    }
-                    return v;
-                }
-            };
-
-            AlertDialog.Builder b = new AlertDialog.Builder(mContext);
-
-            DialogInterface.OnClickListener click = new DialogInterface.OnClickListener() {
-                @Override
-                public final void onClick(DialogInterface dialog, int which) {
-                    if (which >= 0) {
-                        spans[which].onClick(mBodyTextView);
-                    }
-                    dialog.dismiss();
-                }
-            };
-
-            b.setTitle(R.string.select_link_title);
-            b.setCancelable(true);
-            b.setAdapter(adapter, click);
-
-            b.setNegativeButton(android.R.string.cancel, new DialogInterface.OnClickListener() {
-                @Override
-                public final void onClick(DialogInterface dialog, int which) {
-                    dialog.dismiss();
-                }
-            });
-
-            b.show();
+            MessageUtils.onMessageContentClick(mContext, mBodyTextView);
         }
     }
 
     private void setOnClickListener(final MessageItem msgItem) {
         switch(msgItem.mAttachmentType) {
+            case WorkingMessage.VCARD:
+            case WorkingMessage.VCAL:
             case WorkingMessage.IMAGE:
             case WorkingMessage.VIDEO:
                 mImageView.setOnClickListener(new OnClickListener() {
@@ -742,9 +878,16 @@ public class MessageListItem extends LinearLayout implements
         // we show the icon if the read report or delivery report setting was set when the
         // message was sent. Showing the icon tells the user there's more information
         // by selecting the "View report" menu.
-        if (msgItem.mDeliveryStatus == MessageItem.DeliveryStatus.INFO || msgItem.mReadReport
-                || (msgItem.isMms() &&
-                        msgItem.mDeliveryStatus == MessageItem.DeliveryStatus.RECEIVED)) {
+        if (msgItem.mDeliveryStatus == MessageItem.DeliveryStatus.INFO
+                || (msgItem.isMms() && !msgItem.isSending() &&
+                        msgItem.mDeliveryStatus == MessageItem.DeliveryStatus.PENDING)) {
+            mDetailsIndicator.setImageResource(R.drawable.ic_sms_mms_details);
+            mDetailsIndicator.setVisibility(View.VISIBLE);
+        } else if (msgItem.isMms() && !msgItem.isSending() &&
+                msgItem.mDeliveryStatus == MessageItem.DeliveryStatus.RECEIVED) {
+            mDetailsIndicator.setImageResource(R.drawable.ic_sms_mms_delivered);
+            mDetailsIndicator.setVisibility(View.VISIBLE);
+        } else if (msgItem.mReadReport) {
             mDetailsIndicator.setImageResource(R.drawable.ic_sms_mms_details);
             mDetailsIndicator.setVisibility(View.VISIBLE);
         } else {
@@ -834,5 +977,72 @@ public class MessageListItem extends LinearLayout implements
     public void seekVideo(int seekTo) {
         // TODO Auto-generated method stub
 
+    }
+
+    public void updateDelayCountDown() {
+        if (mMessageItem.isSms() && mMessageItem.getCountDown() > 0 && mMessageItem.isSending()) {
+            String content = mContext.getResources().getQuantityString(
+                R.plurals.remaining_delay_time,
+                mMessageItem.getCountDown(), mMessageItem.getCountDown());
+            Spanned spanned = Html.fromHtml(buildTimestampLine(content));
+            mDateView.setText(spanned);
+        } else {
+            mDateView.setText(buildTimestampLine(mMessageItem.isSending()
+                ? mContext.getResources().getString(R.string.sending_message)
+                : mMessageItem.mTimestamp));
+        }
+    }
+
+    @Override
+    public void setVcard(Uri lookupUri, String name) {
+        showMmsView(true);
+
+        try {
+            mImageView.setImageResource(R.drawable.ic_attach_vcard);
+            mImageView.setVisibility(VISIBLE);
+        } catch (java.lang.OutOfMemoryError e) {
+            // shouldn't be here.
+            Log.e(TAG, "setVcard: out of memory: ", e);
+        }
+    }
+
+    @Override
+    public void setVCal(Uri vcalUri, String name) {
+        showMmsView(true);
+
+        try {
+            mImageView.setImageResource(R.drawable.ic_attach_event);
+            mImageView.setVisibility(VISIBLE);
+        } catch (java.lang.OutOfMemoryError e) {
+            // shouldn't be here.
+            Log.e(TAG, "setVCal: out of memory: ", e);
+        }
+    }
+
+    @Override
+    public boolean isChecked() {
+        return mIsCheck;
+    }
+
+    @Override
+    public void setChecked(boolean checked) {
+        mIsCheck = checked;
+        mMessageBlock.setSelected(checked);
+        mAvatar.setChecked(checked, true);
+    }
+
+    @Override
+    public void toggle() {
+    }
+
+    protected void customSIMSmsView() {
+        if (isSimCardMessage()) {
+            // Hide delivery indicator for SIM message
+            mDeliveredIndicator.setVisibility(GONE);
+            // Hide date view because SIM message does not contain sent date.
+            if (mMessageItem.isOutgoingMessage() || mMessageItem.mBoxId == Sms.MESSAGE_TYPE_SENT) {
+                mDateView.setVisibility(View.GONE);
+            }
+        }
     }
 }

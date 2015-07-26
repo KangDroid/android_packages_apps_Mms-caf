@@ -52,6 +52,7 @@ import com.android.mms.LogTag;
 import com.android.mms.MmsConfig;
 import com.android.mms.dom.smil.parser.SmilXmlSerializer;
 import com.android.mms.layout.LayoutManager;
+import com.android.mms.ui.UriImage;
 import com.google.android.mms.ContentType;
 import com.google.android.mms.MmsException;
 import com.google.android.mms.pdu.GenericPdu;
@@ -73,9 +74,10 @@ public class SlideshowModel extends Model
     private int mCurrentMessageSize;    // This is the current message size, not including
                                         // attachments that can be resized (such as photos)
     private int mTotalMessageSize;      // This is the computed total message size
+    private int mSubjectSize;           // This is subject size
     private Context mContext;
 
-    // amount of space to leave in a slideshow for text and overhead.
+    // amount of space to leave in a slideshow for overhead.
     public static final int SLIDESHOW_SLOP = 1024;
 
     private SlideshowModel(Context context) {
@@ -287,9 +289,20 @@ public class SlideshowModel extends Model
 
                 if (media.isText()) {
                     part.setData(((TextModel) media).getText().getBytes());
-                } else if (media.isImage() || media.isVideo() || media.isAudio()) {
+                } else if (media.isImage() || media.isVideo() || media.isAudio()
+                           || media.isVcard() || media.isVCal()) {
                     part.setDataUri(media.getUri());
+                    if (media.isVcard()) {
+                        part.setName(src.getBytes());
+                        if (!TextUtils.isEmpty(((VcardModel) media).getLookupUri())) {
+                            part.setContentDisposition(
+                                    ((VcardModel) media).getLookupUri().getBytes());
+                        }
+                    }
                 } else {
+                    if (media.getUri() != null) {
+                        part.setDataUri(media.getUri());
+                    }
                     Log.w(TAG, "Unsupport media: " + media);
                 }
 
@@ -364,6 +377,10 @@ public class SlideshowModel extends Model
         mCurrentMessageSize = size;
     }
 
+    public void setTotalMessageSize(int size) {
+        mTotalMessageSize = size;
+    }
+
     // getCurrentMessageSize returns the size of the message, not including resizable attachments
     // such as photos. mCurrentMessageSize is used when adding/deleting/replacing non-resizable
     // attachments (movies, sounds, etc) in order to compute how much size is left in the message.
@@ -380,6 +397,53 @@ public class SlideshowModel extends Model
     // MMS message.
     public int getTotalMessageSize() {
         return mTotalMessageSize;
+    }
+
+    public void setSubjectSize(int size) {
+        mSubjectSize = size;
+    }
+
+    public int getSubjectSize() {
+        return mSubjectSize;
+    }
+
+    public int getRemainMessageSize() {
+        int totalMediaSize = 0;
+        for (SlideModel slide : mSlides) {
+            for (MediaModel media : slide) {
+                totalMediaSize += media.getMediaSize();
+            }
+        }
+        setTotalMessageSize(totalMediaSize);
+        // The totalMediaSize include text size which inputting before.
+        // So we don't calculate text size again.
+        int remainSize = MmsConfig.getMaxMessageSize() - getSMILSize() - totalMediaSize
+                - mSubjectSize;
+        return remainSize < SLIDESHOW_SLOP ? 0 : remainSize - SLIDESHOW_SLOP;
+    }
+
+    /*
+     * Get SMIL size when create and edit MMS. Not used for received MMS.
+     */
+    public int getSMILSize() {
+        // first pdu part is SMIL
+        return toPduBody().getPart(0).getData().length;
+    }
+
+    /*
+     * getTotalTextMessageSize returns the total text size of the MMS.
+     */
+    public int getTotalTextMessageSize() {
+        int textSize = 0;
+        if (mSlides.size() > 0) {
+            for (SlideModel slide : mSlides) {
+                TextModel textMode = slide.getText();
+                if (textMode != null) {
+                    textSize += textMode.getMediaSize();
+                }
+            }
+        }
+        return textSize;
     }
 
     public void increaseMessageSize(int increaseSize) {
@@ -633,8 +697,7 @@ public class SlideshowModel extends Model
             return false;
 
         SlideModel slide = get(0);
-        // The slide must have either an image or video, but not both.
-        if (!(slide.hasImage() ^ slide.hasVideo()))
+        if (!isSlideValid(slide))
             return false;
 
         // No audio allowed.
@@ -642,6 +705,20 @@ public class SlideshowModel extends Model
             return false;
 
         return true;
+    }
+
+    private boolean isSlideValid(SlideModel slide) {
+        // The slide must have either an image, video, vcard or vcal and only one of them.
+        boolean hasImage = slide.hasImage();
+        boolean hasVideo = slide.hasVideo();
+        boolean hasVcard = slide.hasVcard();
+        boolean hasVCal = slide.hasVCal();
+        int numAttachments = 0;
+        if (hasImage) numAttachments++;
+        if (hasVideo) numAttachments++;
+        if (hasVcard) numAttachments++;
+        if (hasVCal) numAttachments++;
+        return numAttachments == 1;
     }
 
     /**
@@ -723,4 +800,19 @@ public class SlideshowModel extends Model
         }
     }
 
+    public void updateTotalMessageSize() {
+        int totalSize = 0;
+        for (SlideModel slide : mSlides) {
+            for (MediaModel media : slide) {
+                totalSize += media.getMediaSize();
+            }
+        }
+        if (Log.isLoggable(LogTag.APP, Log.VERBOSE)) {
+            Log.v(TAG, "updateTotalMessageSize: message size: " + totalSize);
+        }
+        // mTotalMessageSize include resizable attachments, getTotalMessageSize
+        // is called by UI for displaying the size of the MMS message, so set
+        // mTotalMessageSize here rather than mCurrentMessageSize.
+        setTotalMessageSize(totalSize);
+    }
 }

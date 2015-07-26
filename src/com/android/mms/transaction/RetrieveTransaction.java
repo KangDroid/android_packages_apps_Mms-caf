@@ -24,6 +24,7 @@ import android.database.sqlite.SqliteWrapper;
 import android.net.Uri;
 import android.provider.Telephony.Mms;
 import android.provider.Telephony.Mms.Inbox;
+import android.telephony.SubscriptionManager;
 import android.text.TextUtils;
 import android.util.Log;
 
@@ -66,6 +67,7 @@ public class RetrieveTransaction extends Transaction implements Runnable {
     private final Uri mUri;
     private final String mContentLocation;
     private boolean mLocked;
+    private boolean isCancelMyself;
 
     static final String[] PROJECTION = new String[] {
         Mms.CONTENT_LOCATION,
@@ -77,9 +79,9 @@ public class RetrieveTransaction extends Transaction implements Runnable {
     static final int COLUMN_LOCKED                = 1;
 
     public RetrieveTransaction(Context context, int serviceId,
-            TransactionSettings connectionSettings, String uri)
+            TransactionSettings connectionSettings, String uri, int subId)
             throws MmsException {
-        super(context, serviceId, connectionSettings);
+        super(context, serviceId, connectionSettings, subId);
 
         if (uri.startsWith("content://")) {
             mUri = Uri.parse(uri); // The Uri of the M-Notification.ind
@@ -129,12 +131,26 @@ public class RetrieveTransaction extends Transaction implements Runnable {
 
     public void run() {
         try {
-            // Change the downloading state of the M-Notification.ind.
-            DownloadManager.getInstance().markState(
-                    mUri, DownloadManager.STATE_DOWNLOADING);
+            DownloadManager downloadManager = DownloadManager.getInstance();
+            //Obtain Message Size from M-Notification.ind for original MMS
+            int msgSize = downloadManager.getMessageSize(mUri);
 
+            // Change the downloading state of the M-Notification.ind.
+            downloadManager.markState( mUri, DownloadManager.STATE_DOWNLOADING);
+
+            if (isCancelMyself) {
+                DownloadManager.getInstance().markState(mUri,
+                        DownloadManager.STATE_TRANSIENT_FAILURE);
+                return;
+            }
             // Send GET request to MMSC and retrieve the response data.
             byte[] resp = getPdu(mContentLocation);
+
+            if (isCancelMyself) {
+                DownloadManager.getInstance().markState(mUri,
+                        DownloadManager.STATE_TRANSIENT_FAILURE);
+                return;
+            }
 
             // Parse M-Retrieve.conf
             RetrieveConf retrieveConf = (RetrieveConf) new PduParser(
@@ -156,8 +172,13 @@ public class RetrieveTransaction extends Transaction implements Runnable {
                         MessagingPreferenceActivity.getIsGroupMmsEnabled(mContext), null);
 
                 // Use local time instead of PDU time
-                ContentValues values = new ContentValues(1);
+                ContentValues values = new ContentValues(4);
                 values.put(Mms.DATE, System.currentTimeMillis() / 1000L);
+                values.put(Mms.SUBSCRIPTION_ID, mSubId);
+                values.put(Mms.PHONE_ID, SubscriptionManager.getPhoneId(mSubId));
+
+                // Update Message Size for Original MMS.
+                values.put(Mms.MESSAGE_SIZE, msgSize);
                 SqliteWrapper.update(mContext, mContext.getContentResolver(),
                         msgUri, values, null, null);
 
@@ -190,7 +211,11 @@ public class RetrieveTransaction extends Transaction implements Runnable {
             Log.e(TAG, Log.getStackTraceString(t));
         } finally {
             if (mTransactionState.getState() != TransactionState.SUCCESS) {
-                mTransactionState.setState(TransactionState.FAILED);
+                if (isCancelMyself) {
+                    mTransactionState.setState(TransactionState.CANCELED);
+                } else {
+                    mTransactionState.setState(TransactionState.FAILED);
+                }
                 mTransactionState.setContentUri(mUri);
                 Log.e(TAG, "Retrieval failed.");
             }
@@ -301,7 +326,23 @@ public class RetrieveTransaction extends Transaction implements Runnable {
     }
 
     @Override
+    public void abort() {
+        Log.d(TAG, "markFailed = " + this);
+        DownloadManager downloadManager = DownloadManager.getInstance();
+
+        downloadManager.markState(mUri, DownloadManager.STATE_SKIP_RETRYING);
+        notifyObservers();
+    }
+
+    @Override
     public int getType() {
         return RETRIEVE_TRANSACTION;
+    }
+
+    @Override
+    public void cancelTransaction(Uri uri) {
+        if (mUri.equals(uri)) {
+            isCancelMyself = true;
+        }
     }
 }

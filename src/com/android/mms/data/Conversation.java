@@ -14,8 +14,11 @@ import android.content.ContentValues;
 import android.content.Context;
 import android.database.Cursor;
 import android.database.sqlite.SqliteWrapper;
+import android.database.sqlite.SQLiteFullException;
 import android.net.Uri;
 import android.os.AsyncTask;
+import android.os.Handler;
+import android.os.Message;
 import android.provider.BaseColumns;
 import android.provider.Telephony.Mms;
 import android.provider.Telephony.MmsSms;
@@ -24,21 +27,25 @@ import android.provider.Telephony.Sms.Conversations;
 import android.provider.Telephony.Threads;
 import android.provider.Telephony.ThreadsColumns;
 import android.telephony.PhoneNumberUtils;
+import android.telephony.SubscriptionManager;
 import android.text.TextUtils;
 import android.util.Log;
+import android.widget.Toast;
 
+import com.android.internal.telephony.PhoneConstants;
 import com.android.mms.LogTag;
 import com.android.mms.MmsApp;
 import com.android.mms.R;
+import com.android.mms.data.cm.CMConversationSettings;
 import com.android.mms.transaction.MessagingNotification;
 import com.android.mms.transaction.MmsMessageSender;
 import com.android.mms.ui.ComposeMessageActivity;
+import com.android.mms.ui.ConversationList;
 import com.android.mms.ui.MessageUtils;
 import com.android.mms.util.AddressUtils;
 import com.android.mms.util.DraftCache;
 
 import com.google.android.mms.pdu.PduHeaders;
-
 /**
  * An interface for finding information about conversations and/or creating new ones.
  */
@@ -46,6 +53,7 @@ public class Conversation {
     private static final String TAG = LogTag.TAG;
     private static final boolean DEBUG = false;
     private static final boolean DELETEDEBUG = false;
+    private static final boolean UNMARKDEBUG = false;
 
     public static final Uri sAllThreadsUri =
         Threads.CONTENT_URI.buildUpon().appendQueryParameter("simple", "true").build();
@@ -56,17 +64,25 @@ public class Conversation {
         Threads.HAS_ATTACHMENT
     };
 
+    public static final String[] ALL_THREADS_DELETE_PROJECTION = {
+            Threads._ID
+    };
+
     public static final String[] UNREAD_PROJECTION = {
         Threads._ID,
         Threads.READ
     };
 
+    public static final String[] CONVERSATION_SETTING = {
+    };
+
     private static final String UNREAD_SELECTION = "(read=0 OR seen=0)";
+    private static final Uri MMS_THREAD_URI = Uri.parse("content://mms/thread");
+    private static final String READ_SELECTION = "(read=1 OR seen=1)";
 
     private static final String[] SEEN_PROJECTION = new String[] {
         "seen"
     };
-
     private static final int ID             = 0;
     private static final int DATE           = 1;
     private static final int MESSAGE_COUNT  = 2;
@@ -96,11 +112,15 @@ public class Conversation {
                                         // multi-operation such as delete.
 
     private static ContentValues sReadContentValues;
+    private static ContentValues sUnReadContentValues;
     private static boolean sLoadingThreads;
     private static boolean sDeletingThreads;
     private static Object sDeletingThreadsLock = new Object();
     private boolean mMarkAsReadBlocked;
     private boolean mMarkAsReadWaiting;
+    private AsyncTask mMarkAsUnreadTask;
+
+    private static Handler sToastHandler = new Handler();
 
     private Conversation(Context context) {
         mContext = context;
@@ -302,6 +322,14 @@ public class Conversation {
         }
     }
 
+    private void buildUnReadContentValues() {
+        if (sUnReadContentValues == null) {
+            sUnReadContentValues = new ContentValues(2);
+            sUnReadContentValues.put("read", 0);
+            sUnReadContentValues.put("seen", 0);
+        }
+    }
+
     private void sendReadReport(final Context context,
             final long threadId,
             final int status) {
@@ -313,9 +341,11 @@ public class Conversation {
             selection = selection + " AND " + Mms.THREAD_ID + " = " + threadId;
         }
 
+        final String[] projection = new String[] {
+            Mms._ID, Mms.MESSAGE_ID, Mms.SUBSCRIPTION_ID
+        };
         final Cursor c = SqliteWrapper.query(context, context.getContentResolver(),
-                        Mms.Inbox.CONTENT_URI, new String[] {Mms._ID, Mms.MESSAGE_ID},
-                        selection, null, null);
+                        Mms.Inbox.CONTENT_URI, projection, selection, null, null);
 
         try {
             if (c == null || c.getCount() == 0) {
@@ -328,7 +358,7 @@ public class Conversation {
                     LogTag.debug("sendReadReport: uri = " + uri);
                 }
                 MmsMessageSender.sendReadRec(context, AddressUtils.getFrom(context, uri),
-                                             c.getString(1), status);
+                                             c.getString(1), c.getInt(2), status);
             }
         } finally {
             if (c != null) {
@@ -337,6 +367,47 @@ public class Conversation {
         }
     }
 
+    public void markAsUnread() {
+        if (mMarkAsUnreadTask != null) {
+            // already a task in progress
+            return;
+        }
+
+        final Uri threadUri = getUri();
+        mMarkAsUnreadTask = new AsyncTask<Void,Void,Void>() {
+            protected Void doInBackground(Void... none) {
+                if (threadUri!=null) {
+                    buildUnReadContentValues();
+                    Long smsID = -1L;
+                    Cursor c = mContext.getContentResolver().query(threadUri,
+                            UNREAD_PROJECTION, READ_SELECTION, null, Sms._ID + " DESC");
+                    boolean needUpdate = false;
+                    if (c != null) {
+                        try {
+                            needUpdate = c.getCount() > 0;
+                            if (needUpdate && c.moveToFirst()) {
+                                smsID = c.getLong(0);
+                            }
+                        } finally {
+                            c.close();
+                        }
+                    }
+
+                    if (needUpdate && smsID!=-1) {
+                        LogTag.debug("markAsUnRead: update read/seen for thread uri: " +
+                                threadUri);
+                        mContext.getContentResolver().update(threadUri, sUnReadContentValues,
+                                Sms._ID + " = "+smsID,null);
+
+                        setHasUnreadMessages(true);
+                    }
+                }
+
+                mMarkAsUnreadTask = null;
+                return null;
+            }
+        }.execute();
+    }
 
     /**
      * Marks all messages in this conversation as read and updates
@@ -344,7 +415,7 @@ public class Conversation {
      * work is dispatched to a background thread. This function should
      * always be called from the UI thread.
      */
-    public void markAsRead() {
+    public void markAsRead(final boolean updateNotifications) {
         if (DELETEDEBUG) {
             Contact.logWithTrace(TAG, "markAsRead mMarkAsReadWaiting: " + mMarkAsReadWaiting +
                     " mMarkAsReadBlocked: " + mMarkAsReadBlocked);
@@ -391,16 +462,25 @@ public class Conversation {
                         sendReadReport(mContext, mThreadId, PduHeaders.READ_STATUS_READ);
                         LogTag.debug("markAsRead: update read/seen for thread uri: " +
                                 threadUri);
-                        mContext.getContentResolver().update(threadUri, sReadContentValues,
-                                UNREAD_SELECTION, null);
+                        try {
+                            mContext.getContentResolver().update(threadUri,
+                                    sReadContentValues, UNREAD_SELECTION, null);
+                        } catch (SQLiteFullException e) {
+                            Log.e(TAG, "Database is full");
+                            e.printStackTrace();
+                            showStorageFullToast(mContext);
+                            return null;
+                        }
                     }
                     setHasUnreadMessages(false);
                 }
-                // Always update notifications regardless of the read state, which is usually
-                // canceling the notification of the thread that was just marked read.
-                MessagingNotification.blockingUpdateAllNotifications(mContext,
-                        MessagingNotification.THREAD_NONE);
 
+                if (updateNotifications) {
+                	// Always update notifications regardless of the read state, which is usually
+	                // canceling the notification of the thread that was just marked read.
+	                MessagingNotification.blockingUpdateAllNotifications(mContext,
+	                        MessagingNotification.THREAD_NONE);
+				}
                 return null;
             }
         }.execute();
@@ -422,7 +502,7 @@ public class Conversation {
             if (!mMarkAsReadBlocked) {
                 if (mMarkAsReadWaiting) {
                     mMarkAsReadWaiting = false;
-                    markAsRead();
+                    markAsRead(true);
                 }
             }
         }
@@ -714,8 +794,9 @@ public class Conversation {
      * @param handler An AsyncQueryHandler that will receive onQueryComplete
      *                upon completion of the query
      * @param token   The token that will be passed to onQueryComplete
+     * @param subId msim subscription id
      */
-    public static void startQueryForAll(AsyncQueryHandler handler, int token) {
+    public static void startQueryForAll(AsyncQueryHandler handler, int token, Integer subId) {
         handler.cancelOperation(token);
 
         // This query looks like this in the log:
@@ -723,7 +804,7 @@ public class Conversation {
         // mmssms.db|2.253 ms|SELECT _id, date, message_count, recipient_ids, snippet, snippet_cs,
         // read, error, has_attachment FROM threads ORDER BY  date DESC
 
-        startQuery(handler, token, null);
+        startQuery(handler, token, null, subId);
     }
 
     /**
@@ -734,8 +815,10 @@ public class Conversation {
      *                upon completion of the query
      * @param token   The token that will be passed to onQueryComplete
      * @param selection   A where clause (can be null) to select particular conv items.
+     * @param subId msim subscription id
      */
-    public static void startQuery(AsyncQueryHandler handler, int token, String selection) {
+    public static void startQuery(AsyncQueryHandler handler,
+                                  int token, String selection, Integer subId) {
         handler.cancelOperation(token);
 
         // This query looks like this in the log:
@@ -743,8 +826,131 @@ public class Conversation {
         // mmssms.db|2.253 ms|SELECT _id, date, message_count, recipient_ids, snippet, snippet_cs,
         // read, error, has_attachment FROM threads ORDER BY  date DESC
 
-        handler.startQuery(token, null, sAllThreadsUri,
+        Uri uri = sAllThreadsUri;
+        if (subId != null) {
+            uri = sAllThreadsUri.buildUpon()
+                    .appendQueryParameter("sub_id", String.valueOf(subId)).build();
+        }
+        handler.startQuery(token, null, uri,
                 ALL_THREADS_PROJECTION, selection, null, Conversations.DEFAULT_SORT_ORDER);
+    }
+
+    /**
+     * Start mark as unread of the conversation with the specified thread ID.
+     *
+     * @param handler An AsyncQueryHandler that will receive onMarkAsUnreadComplete
+     *                upon completion of the conversation being marked as unread
+     * @param token   The token that will be passed to onMarkAsUnreadComplete
+     * @param threadIds Collection of thread IDs of the conversations to be marked as unread
+     */
+    public static void startMarkAsUnread(Context context, ConversationQueryHandler handler,
+                                         int token, Collection<Long> threadIds) {
+        synchronized(sDeletingThreadsLock) {
+            if (UNMARKDEBUG) {
+                Log.v(TAG,"Conversation startMarkAsUnread marking as unread:" +
+                    threadIds.size());
+            }
+            for (long threadId : threadIds) {
+                Conversation c = Conversation.get(context,threadId,true);
+                if (c!=null) {
+                    c.markAsUnread();
+                }
+            }
+        }
+    }
+
+    /**
+     * Start mark as read of the conversation with the specified thread ID.
+     *
+     * @param handler An AsyncQueryHandler that will receive onMarkAsReadComplete
+     *                upon completion of the conversation being marked as read
+     * @param token   The token that will be passed to onMarkAsReadComplete
+     * @param threadIds Collection of thread IDs of the conversations to be marked as read
+     */
+    public static void startMarkAsRead(Context context, ConversationQueryHandler handler,
+                                         int token, Collection<Long> threadIds) {
+        synchronized(sDeletingThreadsLock) {
+            if (UNMARKDEBUG) {
+                Log.v(TAG,"Conversation startMarkAsRead marking as read:" +
+                        threadIds.size());
+            }
+            for (long threadId : threadIds) {
+                Conversation c = Conversation.get(context,threadId,true);
+                if (c!=null) {
+                    c.markAsRead(true);
+                }
+            }
+        }
+    }
+
+    /**
+     * Start mark as unread of the conversation with the specified thread ID.
+     *
+     * @param handler An AsyncQueryHandler that will receive onMarkAsUnreadComplete
+     *                upon completion of the conversation being marked as unread
+     * @param token   The token that will be passed to onMarkAsUnreadComplete
+     */
+    public static void startMarkAsUnreadAll(Context context,  ConversationQueryHandler handler,
+                                            int token) {
+        synchronized(sDeletingThreadsLock) {
+            if (UNMARKDEBUG) {
+                Log.v(TAG,"Conversation startMarkAsUnread marking all as unread");
+            }
+
+            Cursor c = context.getContentResolver().query(sAllThreadsUri,
+                ALL_THREADS_PROJECTION, null, null, null);
+            try {
+                if (c != null) {
+                    ContentResolver resolver = context.getContentResolver();
+                    while (c.moveToNext()) {
+                        long threadId = c.getLong(ID);
+                        Conversation con = Conversation.get(context,threadId,true);
+                        if (con!=null) {
+                            con.markAsUnread();
+                        }
+                   }
+                }
+            } finally {
+                if (c != null) {
+                    c.close();
+                }
+            }
+        }
+    }
+
+    /**
+     * Start mark as read of the conversation with the specified thread ID.
+     *
+     * @param handler An AsyncQueryHandler that will receive onMarkAsReadComplete
+     *                upon completion of the conversation being marked as read
+     * @param token   The token that will be passed to onMarkAsReadComplete
+     */
+    public static void startMarkAsReadAll(Context context,  ConversationQueryHandler handler,
+                                            int token) {
+        synchronized(sDeletingThreadsLock) {
+            if (UNMARKDEBUG) {
+                Log.v(TAG,"Conversation startMarkAsRead marking all as read");
+            }
+
+            Cursor c = context.getContentResolver().query(sAllThreadsUri,
+                    ALL_THREADS_PROJECTION, null, null, null);
+            try {
+                if (c != null) {
+                    ContentResolver resolver = context.getContentResolver();
+                    while (c.moveToNext()) {
+                        long threadId = c.getLong(ID);
+                        Conversation con = Conversation.get(context,threadId,true);
+                        if (con!=null) {
+                            con.markAsRead(true);
+                        }
+                    }
+                }
+            } finally {
+                if (c != null) {
+                    c.close();
+                }
+            }
+        }
     }
 
     /**
@@ -757,7 +963,7 @@ public class Conversation {
      * @param threadIds Collection of thread IDs of the conversations to be deleted
      */
     public static void startDelete(ConversationQueryHandler handler, int token, boolean deleteAll,
-            Collection<Long> threadIds) {
+            Collection<Long> threadIds, ConversationList.MessageDeleteTypes deleteType) {
         synchronized(sDeletingThreadsLock) {
             if (DELETEDEBUG) {
                 Log.v(TAG, "Conversation startDelete sDeletingThreads: " +
@@ -770,13 +976,26 @@ public class Conversation {
             sDeletingThreads = true;
 
             for (long threadId : threadIds) {
-                Uri uri = ContentUris.withAppendedId(Threads.CONTENT_URI, threadId);
+                Uri uri = null;
+                switch (deleteType) {
+                    case ALL:
+                        uri = ContentUris.withAppendedId(Threads.CONTENT_URI, threadId);
+                        break;
+                    case SMS:
+                        uri = ContentUris.withAppendedId(Conversations.CONTENT_URI, threadId);
+                        break;
+                    case MMS:
+                        uri = ContentUris.withAppendedId(MMS_THREAD_URI, threadId);
+                        break;
+                }
                 String selection = deleteAll ? null : "locked=0";
 
                 handler.setDeleteToken(token);
                 handler.startDelete(token, new Long(threadId), uri, selection, null);
 
                 DraftCache.getInstance().setDraftState(threadId, false);
+
+                CMConversationSettings.delete(MmsApp.getApplication(), threadId);
             }
         }
     }
@@ -807,6 +1026,8 @@ public class Conversation {
 
             handler.setDeleteToken(token);
             handler.startDelete(token, new Long(-1), Threads.CONTENT_URI, selection, null);
+
+            CMConversationSettings.deleteAll(app);
         }
     }
 
@@ -850,32 +1071,55 @@ public class Conversation {
      * Check for locked messages in all threads or a specified thread.
      * @param handler An AsyncQueryHandler that will receive onQueryComplete
      *                upon completion of looking for locked messages
-     * @param threadIds   A list of threads to search. null means all threads
      * @param token   The token that will be passed to onQueryComplete
      */
     public static void startQueryHaveLockedMessages(AsyncQueryHandler handler,
-            Collection<Long> threadIds,
-            int token) {
+            int token, ConversationList.DeleteInfo info) {
         handler.cancelOperation(token);
-        Uri uri = MmsSms.CONTENT_LOCKED_URI;
+
+        Uri uri = null;
+
+        switch (info.getDeleteType()) {
+            case SMS:
+                uri = Sms.CONTENT_URI;
+                break;
+            case MMS:
+                uri = Mms.CONTENT_URI;
+                break;
+            case ALL:
+                uri = MmsSms.CONTENT_LOCKED_URI;
+                break;
+        }
 
         String selection = null;
-        if (threadIds != null) {
-            StringBuilder buf = new StringBuilder();
+        if (info.getThreadIds() != null && info.getThreadIds().size() > 0) {
+            StringBuilder buf = new StringBuilder(Mms.THREAD_ID);
+            buf.append(" in (");
             int i = 0;
 
-            for (long threadId : threadIds) {
-                if (i++ > 0) {
-                    buf.append(" OR ");
+            for (long threadId : info.getThreadIds()) {
+                if (i > 0) {
+                    buf.append(",");
                 }
-                // We have to build the selection arg into the selection because deep down in
-                // provider, the function buildUnionSubQuery takes selectionArgs, but ignores it.
-                buf.append(Mms.THREAD_ID).append("=").append(Long.toString(threadId));
+                buf.append(threadId);
+                i++;
             }
+            buf.append(")");
+
+            switch (info.getDeleteType()) {
+                case SMS:
+                    buf.append(" AND ").append(Sms.LOCKED).append("=").append("1");
+                    break;
+                case MMS:
+                    buf.append(" AND ").append(Mms.LOCKED).append("=").append("1");
+                    break;
+            }
+
             selection = buf.toString();
         }
-        handler.startQuery(token, threadIds, uri,
-                ALL_THREADS_PROJECTION, selection, null, Conversations.DEFAULT_SORT_ORDER);
+
+        handler.startQuery(token, info, uri,
+                ALL_THREADS_DELETE_PROJECTION, selection, null, Conversations.DEFAULT_SORT_ORDER);
     }
 
     /**
@@ -886,14 +1130,14 @@ public class Conversation {
      * @param token   The token that will be passed to onQueryComplete
      */
     public static void startQueryHaveLockedMessages(AsyncQueryHandler handler,
-            long threadId,
-            int token) {
+            long threadId, int token, ConversationList.DeleteInfo info) {
         ArrayList<Long> threadIds = null;
         if (threadId != -1) {
             threadIds = new ArrayList<Long>();
             threadIds.add(threadId);
         }
-        startQueryHaveLockedMessages(handler, threadIds, token);
+        info.setThreadIds(threadIds);
+        startQueryHaveLockedMessages(handler, token, info);
     }
 
     /**
@@ -1153,10 +1397,23 @@ public class Conversation {
         ContentValues values = new ContentValues(1);
         values.put("seen", 1);
 
-        resolver.update(Sms.Inbox.CONTENT_URI,
-                values,
-                "seen=0",
-                null);
+        try {
+            resolver.update(Sms.Inbox.CONTENT_URI, values, "seen=0", null);
+        } catch (SQLiteFullException e) {
+            Log.e(TAG, "Database is full");
+            e.printStackTrace();
+            showStorageFullToast(context);
+        }
+    }
+
+    private static void showStorageFullToast(final Context context) {
+        sToastHandler.post(new Runnable() {
+            @Override
+            public void run() {
+                int duration = Toast.LENGTH_SHORT;
+                Toast.makeText(context, R.string.disk_storage_full_error, duration).show();
+            }
+        });
     }
 
     private static void blockingMarkAllMmsMessagesAsSeen(final Context context) {
@@ -1188,10 +1445,13 @@ public class Conversation {
         ContentValues values = new ContentValues(1);
         values.put("seen", 1);
 
-        resolver.update(Mms.Inbox.CONTENT_URI,
-                values,
-                "seen=0",
-                null);
+        try {
+            resolver.update(Mms.Inbox.CONTENT_URI, values, "seen=0", null);
+        } catch (SQLiteFullException e) {
+            Log.e(TAG, "Database is full");
+            e.printStackTrace();
+            showStorageFullToast(context);
+        }
 
     }
 
